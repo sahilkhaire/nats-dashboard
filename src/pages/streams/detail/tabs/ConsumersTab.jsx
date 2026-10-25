@@ -1,145 +1,73 @@
-import { useCallback } from 'react'
-import { useTableSort } from '../../../../hooks/useTableSort'
-import { useConsumerAckRates, formatAckRate, consumerRowKey } from '../../../../hooks/useConsumerAckRates'
-import { AlertBanner } from '../../../../components/AlertBanner'
-import { SortableTh } from '../../../../components/ui'
+import { useState } from 'react'
+import { Plus, Waves } from 'lucide-react'
+import { useConsumerAckRates, formatAckRate } from '../../../../hooks/useConsumerAckRates'
+import { useConfig } from '../../../../context/ConfigContext'
+import { useStreamMutation } from '../../../../hooks/useStreamMutation'
+import { useNotifications } from '../../../../context/NotificationContext'
+import { useConfirmDialog } from '../../../../components/shared/ConfirmDialogProvider'
+import { ConsumerTable } from '../../../../components/consumers/ConsumerTable'
+import { ConsumerModal } from '../../../../components/modals/ConsumerModal'
+import { EmptyState } from '../../../../components/shared/EmptyState'
+import { MetricCard } from '../../../../components/ui/MetricCard'
+import { Button } from '../../../../components/ui/button'
+import { formatCompact, formatNumber } from '../../../../utils/byteFormatter'
 
-const formatFloor = (floor) => {
-  if (!floor) return '—'
-  return (floor.stream_seq ?? floor.consumer_seq ?? 0).toLocaleString()
-}
+export function ConsumersTab({ consumers, lastFetch, stream, onChanged }) {
+  const { connection } = useConfig()
+  const rates = useConsumerAckRates(consumers, lastFetch, `${connection?.id}:${stream.name}`)
+  const windowLabel = rates.spanMs > 0 ? `avg over last ${Math.round(rates.spanMs / 1000)}s` : 'collecting samples…'
+  const { createConsumer, deleteConsumer } = useStreamMutation()
+  const { notifyError, notifySuccess } = useNotifications()
+  const { confirm } = useConfirmDialog()
+  const [open, setOpen] = useState(false)
 
-const formatPausedUntil = (consumer) => {
-  if (!consumer?.paused) return '—'
-  const raw =
-    consumer.pause_remaining ??
-    consumer.paused_until ??
-    consumer.pause_until ??
-    consumer.config?.pause_until
-  if (!raw) return 'Paused'
-  if (typeof raw === 'number') return `${raw.toLocaleString()}ns`
-  const parsed = Date.parse(raw)
-  if (Number.isNaN(parsed)) return String(raw)
-  return new Date(parsed).toLocaleString()
-}
-
-const metricColorClass = (value, warnAt, dangerAt) => {
-  if (value >= dangerAt) return 'text-nats-error'
-  if (value >= warnAt) return 'text-nats-warn'
-  return 'text-muted-foreground'
-}
-
-export function ConsumersTab({ consumers, lastFetch, streamName, refreshInterval }) {
-  const {
-    inRatesByName,
-    outRatesByName,
-    combinedInRate,
-    combinedOutRate,
-  } = useConsumerAckRates(
-    consumers,
-    lastFetch,
-    streamName ?? '',
-    refreshInterval ?? 2000
-  )
-
-  const getSortValue = useCallback(
-    (c, key) => {
-      if (key === 'name') return c.name ?? ''
-      if (key === 'filter_subjects') return c.config?.filter_subject || c.config?.filter_subjects?.join(',') || ''
-      if (key === 'ack_floor') return c.ack_floor?.consumer_seq ?? 0
-      if (key === 'in_rate') return inRatesByName.get(consumerRowKey(c)) ?? -1
-      if (key === 'out_rate') return outRatesByName.get(consumerRowKey(c)) ?? -1
-      if (key === 'pending') return c.num_pending ?? 0
-      if (key === 'ack_pending') return c.num_ack_pending ?? 0
-      if (key === 'num_waiting') return c.num_waiting ?? 0
-      if (key === 'redelivered') return c.num_redelivered ?? 0
-      if (key === 'ack_policy') return c.config?.ack_policy ?? ''
-      if (key === 'deliver_policy') return c.config?.deliver_policy ?? ''
-      if (key === 'paused_until') return c.paused ? 1 : 0
-      return ''
-    },
-    [inRatesByName, outRatesByName]
-  )
-
-  const { sortedData, sortBy, sortDir, handleSort } = useTableSort(consumers, {
-    defaultSortBy: 'name',
-    getSortValue,
-  })
-
-  if (consumers.length === 0) {
-    return (
-      <div className="rounded-lg border border-border bg-card p-8 text-center text-muted-foreground">
-        No consumers on this stream.
-      </div>
-    )
+  const handleDelete = async (c) => {
+    const name = c.name ?? c.config?.durable_name
+    const ok = await confirm(`Delete consumer "${name}"?`, 'Clients bound to it will stop receiving messages. Its delivery state is lost.', { confirmLabel: 'Delete consumer' })
+    if (!ok) return
+    try {
+      await deleteConsumer(stream.name, name)
+      notifySuccess('Consumer deleted', `"${name}" was removed.`, 'consumer')
+      onChanged?.()
+    } catch (err) {
+      notifyError('Delete failed', err.message, 'consumer')
+    }
   }
 
-  const lagging = consumers.filter(c => (c.num_pending ?? 0) > 1000 || (c.num_ack_pending ?? 0) > 0)
+  const pending = consumers.reduce((s, c) => s + (c.num_pending ?? 0), 0)
+  const unacked = consumers.reduce((s, c) => s + (c.num_ack_pending ?? 0), 0)
 
   return (
     <div className="space-y-4">
-      {lagging.length > 0 && (
-        <AlertBanner variant="warn" title="Consumers with lag">
-          {lagging.length} consumer(s) have pending or unacked messages.
-        </AlertBanner>
+      {consumers.length === 0 ? (
+        <div className="surface-card">
+          <EmptyState icon={Waves} title="No consumers on this stream" description="Consumers track delivery progress for applications reading from the stream."
+            action={<Button onClick={() => setOpen(true)} disabled={stream.config?.sealed}><Plus size={15} /> New consumer</Button>} />
+        </div>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+            <MetricCard label="Pending" value={formatCompact(pending)} subtext="not yet delivered" tone={pending > 10000 ? 'warn' : 'default'} />
+            <MetricCard label="Awaiting ack" value={formatNumber(unacked)} />
+            <MetricCard label="Delivered / s" value={formatAckRate(rates.combinedInRate)} subtext={windowLabel} />
+            <MetricCard label="Acked / s" value={formatAckRate(rates.combinedOutRate)} subtext={windowLabel} />
+          </div>
+          <div className="flex justify-end">
+            <Button size="sm" onClick={() => setOpen(true)} disabled={stream.config?.sealed}><Plus size={14} /> New consumer</Button>
+          </div>
+          <ConsumerTable consumers={consumers} rates={rates} onDelete={handleDelete} />
+        </>
       )}
-      <div className="grid gap-3 sm:grid-cols-2">
-        <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-card px-4 py-3 text-sm">
-          <span className="text-muted-foreground">Incoming (delivered)</span>
-          <span className="font-mono font-medium text-foreground">{formatAckRate(combinedInRate)}</span>
-        </div>
-        <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-card px-4 py-3 text-sm">
-          <span className="text-muted-foreground">Outgoing (acked)</span>
-          <span className="font-mono font-medium text-foreground">{formatAckRate(combinedOutRate)}</span>
-        </div>
-      </div>
-      <div className="overflow-hidden rounded-lg border border-border bg-card">
-        <table className="w-full text-sm">
-          <thead className="border-b border-border bg-card">
-            <tr>
-              <SortableTh sortKey="name" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Name</SortableTh>
-              <SortableTh sortKey="filter_subjects" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Filter Subjects</SortableTh>
-              <SortableTh sortKey="pending" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Unprocessed Msgs</SortableTh>
-              <SortableTh sortKey="ack_pending" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Outstanding Acks</SortableTh>
-              <SortableTh sortKey="ack_floor" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Ack Floor</SortableTh>
-              <SortableTh sortKey="in_rate" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>In / s</SortableTh>
-              <SortableTh sortKey="out_rate" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Out / s</SortableTh>
-              <SortableTh sortKey="num_waiting" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Waiting Clients</SortableTh>
-              <SortableTh sortKey="redelivered" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Redelivered Msgs</SortableTh>
-              <SortableTh sortKey="ack_policy" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Ack Policy</SortableTh>
-              <SortableTh sortKey="deliver_policy" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Deliver Policy</SortableTh>
-              <SortableTh sortKey="paused_until" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Paused Until</SortableTh>
-            </tr>
-          </thead>
-          <tbody>
-            {sortedData.map(c => {
-              const rowKey = consumerRowKey(c)
-              return (
-                <tr key={rowKey ?? c.name} className="border-b border-border hover:bg-muted/30">
-                  <td className="p-3 font-mono font-medium text-nats-accent">{c.name ?? c.config?.durable_name ?? '—'}</td>
-                  <td className="p-3 font-mono text-xs text-foreground">
-                    {c.config?.filter_subject || c.config?.filter_subjects?.join(', ') || '—'}
-                  </td>
-                  <td className={`p-3 font-mono ${metricColorClass(c.num_pending ?? 0, 100, 1000)}`}>
-                    {(c.num_pending ?? 0).toLocaleString()}
-                  </td>
-                  <td className={`p-3 font-mono ${metricColorClass(c.num_ack_pending ?? 0, 1, 100)}`}>
-                    {(c.num_ack_pending ?? 0).toLocaleString()}
-                  </td>
-                  <td className="p-3 font-mono text-muted-foreground">{formatFloor(c.ack_floor)}</td>
-                  <td className="p-3 font-mono text-muted-foreground">{formatAckRate(inRatesByName.get(rowKey))}</td>
-                  <td className="p-3 font-mono text-muted-foreground">{formatAckRate(outRatesByName.get(rowKey))}</td>
-                  <td className={`p-3 font-mono ${metricColorClass(c.num_waiting ?? 0, 1, 100)}`}>{(c.num_waiting ?? 0).toLocaleString()}</td>
-                  <td className={`p-3 font-mono ${metricColorClass(c.num_redelivered ?? 0, 1, 50)}`}>{c.num_redelivered ?? 0}</td>
-                  <td className="p-3 text-xs text-foreground">{c.config?.ack_policy ?? '—'}</td>
-                  <td className="p-3 text-xs text-foreground">{c.config?.deliver_policy ?? '—'}</td>
-                  <td className="p-3 text-xs text-muted-foreground">{formatPausedUntil(c)}</td>
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
-      </div>
+      <ConsumerModal
+        open={open}
+        stream={stream.name}
+        onClose={() => setOpen(false)}
+        onCreate={async (cfg) => {
+          await createConsumer(stream.name, cfg)
+          notifySuccess('Consumer created', `"${cfg.name}" is ready.`, 'consumer')
+          onChanged?.()
+        }}
+      />
     </div>
   )
 }

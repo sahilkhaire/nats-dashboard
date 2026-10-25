@@ -1,219 +1,256 @@
-import { useState, useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { normalizeRetention } from '../../utils/retention'
+import { nsToDuration, parseDurationToNs } from '../../utils/duration'
 import { Button } from '../ui/button'
-import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '../ui/dialog'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '../ui/dialog'
 import { Input } from '../ui/input'
 
-const RETENTION_OPTIONS = ['limits', 'interest', 'workqueue']
+const NAME_RE = /^[^\s.*>/\\]+$/
 
-function parseDurationToNs(s) {
-  if (s === '' || s == null) return undefined
-  if (typeof s === 'number') return s
-  const m = String(s).trim().match(/^(\d+)(ns|us|ms|s|m|h|d|y)$/i)
-  if (!m) return undefined
-  const v = parseInt(m[1], 10)
-  const u = m[2].toLowerCase()
-  const mult = { ns: 1, us: 1e3, ms: 1e6, s: 1e9, m: 60e9, h: 3600e9, d: 86400e9, y: 31536000e9 }
-  const result = v * (mult[u] ?? 0)
-  return isNaN(result) ? undefined : result
+const blankForm = {
+  name: '',
+  description: '',
+  subjects: '',
+  storage: 'file',
+  retention: 'limits',
+  num_replicas: '1',
+  max_msgs: '',
+  max_bytes: '',
+  max_age: '',
+  max_msg_size: '',
+  max_msgs_per_subject: '',
+  discard: 'old',
+  discard_new_per_subject: false,
+  duplicate_window: '2m',
+  allow_direct: true,
+  allow_rollup_hdrs: false,
+  deny_delete: false,
+  deny_purge: false,
+  compression: 'none',
 }
 
-function nsToDuration(ns) {
-  if (!ns || ns === 0) return ''
-  if (ns >= 86400e9) return `${Math.round(ns / 86400e9)}d`
-  if (ns >= 3600e9) return `${Math.round(ns / 3600e9)}h`
-  if (ns >= 60e9) return `${Math.round(ns / 60e9)}m`
-  if (ns >= 1e9) return `${Math.round(ns / 1e9)}s`
-  return `${ns}ns`
-}
-const STORAGE_OPTIONS = ['file', 'memory']
-const DISCARD_OPTIONS = ['old', 'new']
+const limitToField = (v) => (v == null || v < 0 ? '' : String(v))
 
+function configToForm(cfg = {}) {
+  return {
+    ...blankForm,
+    name: cfg.name || '',
+    description: cfg.description || '',
+    subjects: (cfg.subjects || []).join(', '),
+    storage: cfg.storage || 'file',
+    retention: normalizeRetention(cfg.retention),
+    num_replicas: String(cfg.num_replicas || 1),
+    max_msgs: limitToField(cfg.max_msgs),
+    max_bytes: limitToField(cfg.max_bytes),
+    max_age: cfg.max_age ? nsToDuration(cfg.max_age) : '',
+    max_msg_size: limitToField(cfg.max_msg_size),
+    max_msgs_per_subject: limitToField(cfg.max_msgs_per_subject),
+    discard: cfg.discard || 'old',
+    discard_new_per_subject: Boolean(cfg.discard_new_per_subject),
+    duplicate_window: cfg.duplicate_window ? nsToDuration(cfg.duplicate_window) : '',
+    allow_direct: Boolean(cfg.allow_direct),
+    allow_rollup_hdrs: Boolean(cfg.allow_rollup_hdrs),
+    deny_delete: Boolean(cfg.deny_delete),
+    deny_purge: Boolean(cfg.deny_purge),
+    compression: cfg.compression || 'none',
+  }
+}
+
+function parseLimit(v, label) {
+  if (v === '' || v == null) return -1
+  const n = Number(v)
+  if (!Number.isInteger(n) || n < -1) throw new Error(`${label} must be a whole number (empty = unlimited)`)
+  return n === 0 ? -1 : n
+}
+
+function formToConfig(form, { creating }) {
+  const cfg = {}
+  if (creating) {
+    const name = form.name.trim()
+    if (!NAME_RE.test(name)) throw new Error('Stream name is required and cannot contain spaces, ".", "*", ">" or slashes')
+    cfg.name = name
+    cfg.storage = form.storage
+  }
+  const subjects = form.subjects.split(',').map((s) => s.trim()).filter(Boolean)
+  if (creating && subjects.length === 0) throw new Error('At least one subject is required (e.g. orders.>)')
+  if (subjects.length) cfg.subjects = subjects
+  cfg.description = form.description.trim() || undefined
+  cfg.retention = form.retention
+  cfg.num_replicas = Number(form.num_replicas) || 1
+  cfg.max_msgs = parseLimit(form.max_msgs, 'Max messages')
+  cfg.max_bytes = parseLimit(form.max_bytes, 'Max bytes')
+  cfg.max_msg_size = parseLimit(form.max_msg_size, 'Max message size')
+  cfg.max_msgs_per_subject = parseLimit(form.max_msgs_per_subject, 'Max messages per subject')
+  const maxAge = parseDurationToNs(form.max_age)
+  if (maxAge === null) throw new Error('Max age must be a duration like 24h, 7d or 1h30m')
+  cfg.max_age = maxAge
+  const dupe = parseDurationToNs(form.duplicate_window)
+  if (dupe === null) throw new Error('Duplicate window must be a duration like 2m')
+  if (dupe > 0) cfg.duplicate_window = dupe
+  cfg.discard = form.discard
+  cfg.discard_new_per_subject = form.discard === 'new' && form.discard_new_per_subject
+  cfg.allow_direct = form.allow_direct
+  cfg.allow_rollup_hdrs = form.allow_rollup_hdrs
+  cfg.deny_delete = form.deny_delete
+  cfg.deny_purge = form.deny_purge
+  cfg.compression = form.compression
+  return cfg
+}
+
+function Field({ label, hint, children, className }) {
+  return (
+    <div className={className}>
+      <label className="field-label">{label}</label>
+      {children}
+      {hint && <p className="field-hint">{hint}</p>}
+    </div>
+  )
+}
+
+function Toggle({ checked, onChange, label, hint, disabled }) {
+  return (
+    <label className={`flex cursor-pointer items-start gap-2.5 rounded-md border border-border p-2.5 ${disabled ? 'opacity-50' : 'hover:bg-muted/40'}`}>
+      <input type="checkbox" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} className="mt-0.5" />
+      <span>
+        <span className="block text-sm">{label}</span>
+        {hint && <span className="block text-[11px] text-muted-foreground">{hint}</span>}
+      </span>
+    </label>
+  )
+}
+
+/**
+ * Create (no `stream`) or edit (with `stream` + `config`) a stream.
+ * onSave(streamName, config) for edits, onSave(null, config) for creates.
+ */
 export function UpdateStreamModal({ open, stream, config, onClose, onSave }) {
-  const [subjects, setSubjects] = useState('')
-  const [retention, setRetention] = useState('limits')
-  const [maxMsgs, setMaxMsgs] = useState('')
-  const [maxBytes, setMaxBytes] = useState('')
-  const [maxAge, setMaxAge] = useState('')
-  const [maxMsgSize, setMaxMsgSize] = useState('')
-  const [storage, setStorage] = useState('file')
-  const [discard, setDiscard] = useState('old')
-  const [discardNewPerSubject, setDiscardNewPerSubject] = useState(false)
+  const creating = !stream
+  const [form, setForm] = useState(blankForm)
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
 
   useEffect(() => {
-    if (open && config) {
-      setSubjects((config.subjects || []).join(', '))
-      setRetention(normalizeRetention(config.retention))
-      setMaxMsgs(config.max_msgs?.toString() ?? '')
-      setMaxBytes(config.max_bytes?.toString() ?? '')
-      setMaxAge(nsToDuration(config.max_age) || '')
-      setMaxMsgSize(config.max_msg_size?.toString() ?? '')
-      setStorage(config.storage || 'file')
-      setDiscard(config.discard || 'old')
-      setDiscardNewPerSubject(config.discard_new_per_subject ?? false)
+    if (open) {
+      setForm(creating ? blankForm : configToForm(config))
       setError('')
     }
-  }, [open, config])
+  }, [open, config, creating])
+
+  const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e?.target ? (e.target.type === 'checkbox' ? e.target.checked : e.target.value) : e }))
 
   const handleSubmit = async (e) => {
     e.preventDefault()
     setError('')
+    let cfg
+    try {
+      cfg = formToConfig(form, { creating })
+    } catch (err) {
+      setError(err.message)
+      return
+    }
     setSaving(true)
     try {
-      const cfg = {}
-      const subjList = subjects.trim() ? subjects.split(',').map(s => s.trim()).filter(Boolean) : []
-      if (subjList.length > 0) cfg.subjects = subjList
-      if (retention) cfg.retention = retention
-      if (maxMsgs !== '') cfg.max_msgs = parseInt(maxMsgs, 10) || 0
-      if (maxBytes !== '') cfg.max_bytes = parseInt(maxBytes, 10) || 0
-      const maxAgeNs = parseDurationToNs(maxAge)
-      if (maxAgeNs !== undefined && !isNaN(maxAgeNs)) cfg.max_age = maxAgeNs
-      if (maxMsgSize !== '') cfg.max_msg_size = parseInt(maxMsgSize, 10) || 0
-      if (storage) cfg.storage = storage
-      if (discard) cfg.discard = discard
-      cfg.discard_new_per_subject = discardNewPerSubject
-
-      await onSave(stream, cfg)
+      await onSave(creating ? null : stream, cfg)
       onClose()
     } catch (err) {
-      setError(err.message || 'Update failed')
+      setError(err.message || 'Save failed')
     } finally {
       setSaving(false)
     }
   }
 
+  const isMirror = Boolean(config?.mirror)
+
   return (
-    <Dialog open={open} onOpenChange={(next) => !next && onClose()}>
-      <DialogContent className="max-h-[90vh] max-w-lg overflow-y-auto">
+    <Dialog open={open} onOpenChange={(next) => !next && !saving && onClose()}>
+      <DialogContent className="max-w-2xl">
         <DialogHeader>
-          <DialogTitle className="font-mono">Update stream: {stream}</DialogTitle>
+          <DialogTitle>{creating ? 'Create stream' : <>Edit stream <span className="font-mono">{stream}</span></>}</DialogTitle>
+          <DialogDescription>
+            {creating ? 'Streams capture messages published on their subjects.' : 'Storage type cannot be changed after creation. Some changes (e.g. retention) may be rejected by the server.'}
+          </DialogDescription>
         </DialogHeader>
-        <form onSubmit={handleSubmit} className="space-y-4">
-            {error && (
-              <div className="rounded border border-destructive/50 bg-destructive/20 p-3 text-sm text-destructive">
-                {error}
-              </div>
-            )}
-            <div>
-              <label className="mb-1 block text-sm font-medium text-muted-foreground">Subjects (comma-separated)</label>
-              <Input
-                type="text"
-                value={subjects}
-                onChange={(e) => setSubjects(e.target.value)}
-                placeholder="e.g. orders.>, events.>"
-              />
+        <form onSubmit={handleSubmit} className="space-y-5">
+          {error && (
+            <div role="alert" className="rounded-md border border-nats-error/40 bg-nats-error/10 px-3 py-2 text-sm text-nats-error">{error}</div>
+          )}
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            {creating ? (
+              <Field label="Name *">
+                <Input value={form.name} onChange={set('name')} placeholder="ORDERS" className="font-mono" autoFocus required />
+              </Field>
+            ) : null}
+            <Field label="Description" className={creating ? '' : 'sm:col-span-2'}>
+              <Input value={form.description} onChange={set('description')} placeholder="Optional" />
+            </Field>
+            <Field label={creating ? 'Subjects *' : 'Subjects'} hint="Comma separated, wildcards allowed (orders.>, events.*)" className="sm:col-span-2">
+              <Input value={form.subjects} onChange={set('subjects')} placeholder="orders.>, payments.*" className="font-mono" disabled={isMirror}
+                title={isMirror ? 'Mirrors do not have subjects' : undefined} />
+            </Field>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-3">
+            <Field label="Storage" hint={creating ? undefined : 'Fixed at creation'}>
+              <select className="input-enterprise" value={form.storage} onChange={set('storage')} disabled={!creating}>
+                <option value="file">File</option>
+                <option value="memory">Memory</option>
+              </select>
+            </Field>
+            <Field label="Retention">
+              <select className="input-enterprise" value={form.retention} onChange={set('retention')}>
+                <option value="limits">Limits</option>
+                <option value="interest">Interest</option>
+                <option value="workqueue">Work queue</option>
+              </select>
+            </Field>
+            <Field label="Replicas">
+              <select className="input-enterprise" value={form.num_replicas} onChange={set('num_replicas')}>
+                {['1', '3', '5'].map((r) => <option key={r} value={r}>{r}</option>)}
+                {!['1', '3', '5'].includes(form.num_replicas) && <option value={form.num_replicas}>{form.num_replicas}</option>}
+              </select>
+            </Field>
+          </div>
+
+          <div>
+            <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Limits <span className="font-normal normal-case">— leave empty for unlimited</span></div>
+            <div className="grid gap-4 sm:grid-cols-3">
+              <Field label="Max age" hint="e.g. 24h, 7d, 1h30m"><Input value={form.max_age} onChange={set('max_age')} placeholder="unlimited" className="font-mono" /></Field>
+              <Field label="Max messages"><Input type="number" min="-1" value={form.max_msgs} onChange={set('max_msgs')} placeholder="unlimited" className="font-mono" /></Field>
+              <Field label="Max bytes"><Input type="number" min="-1" value={form.max_bytes} onChange={set('max_bytes')} placeholder="unlimited" className="font-mono" /></Field>
+              <Field label="Max message size (bytes)"><Input type="number" min="-1" value={form.max_msg_size} onChange={set('max_msg_size')} placeholder="server default" className="font-mono" /></Field>
+              <Field label="Max msgs per subject"><Input type="number" min="-1" value={form.max_msgs_per_subject} onChange={set('max_msgs_per_subject')} placeholder="unlimited" className="font-mono" /></Field>
+              <Field label="Duplicate window" hint="Deduplication by Nats-Msg-Id"><Input value={form.duplicate_window} onChange={set('duplicate_window')} placeholder="2m" className="font-mono" /></Field>
             </div>
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="mb-1 block text-sm font-medium text-muted-foreground">Retention</label>
-                <select
-                  value={retention}
-                  onChange={(e) => setRetention(e.target.value)}
-                  className="input-enterprise"
-                >
-                  {RETENTION_OPTIONS.map(r => (
-                    <option key={r} value={r}>{r}</option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <label className="mb-1 block text-sm font-medium text-muted-foreground">Storage</label>
-                <select
-                  value={storage}
-                  onChange={(e) => setStorage(e.target.value)}
-                  className="input-enterprise"
-                >
-                  {STORAGE_OPTIONS.map(s => (
-                    <option key={s} value={s}>{s}</option>
-                  ))}
-                </select>
-              </div>
-            </div>
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="mb-1 block text-sm font-medium text-muted-foreground">Max messages</label>
-                <Input
-                  type="number"
-                  min="0"
-                  value={maxMsgs}
-                  onChange={(e) => setMaxMsgs(e.target.value)}
-                  placeholder="0 = unlimited"
-                />
-              </div>
-              <div>
-                <label className="mb-1 block text-sm font-medium text-muted-foreground">Max bytes</label>
-                <Input
-                  type="number"
-                  min="0"
-                  value={maxBytes}
-                  onChange={(e) => setMaxBytes(e.target.value)}
-                  placeholder="0 = unlimited"
-                />
-              </div>
-            </div>
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="mb-1 block text-sm font-medium text-muted-foreground">Max age (e.g. 24h, 7d)</label>
-                <Input
-                  type="text"
-                  value={maxAge}
-                  onChange={(e) => setMaxAge(e.target.value)}
-                  placeholder="e.g. 24h"
-                />
-              </div>
-              <div>
-                <label className="mb-1 block text-sm font-medium text-muted-foreground">Max message size (bytes)</label>
-                <Input
-                  type="number"
-                  min="0"
-                  value={maxMsgSize}
-                  onChange={(e) => setMaxMsgSize(e.target.value)}
-                  placeholder="0 = unlimited"
-                />
-              </div>
-            </div>
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="mb-1 block text-sm font-medium text-muted-foreground">Discard policy</label>
-                <select
-                  value={discard}
-                  onChange={(e) => setDiscard(e.target.value)}
-                  className="input-enterprise"
-                >
-                  {DISCARD_OPTIONS.map(d => (
-                    <option key={d} value={d}>{d}</option>
-                  ))}
-                </select>
-              </div>
-              <div className="flex items-end pb-2">
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={discardNewPerSubject}
-                    onChange={(e) => setDiscardNewPerSubject(e.target.checked)}
-                    className="rounded border-border"
-                  />
-                  <span className="text-sm text-muted-foreground">Discard new per subject</span>
-                </label>
-              </div>
-            </div>
-            <DialogFooter className="pt-4">
-              <Button
-                type="button"
-                onClick={onClose}
-                variant="outline"
-              >
-                Cancel
-              </Button>
-              <Button
-                type="submit"
-                disabled={saving}
-              >
-                {saving ? 'Saving...' : 'Save'}
-              </Button>
-            </DialogFooter>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-3">
+            <Field label="When limits are reached">
+              <select className="input-enterprise" value={form.discard} onChange={set('discard')}>
+                <option value="old">Discard old messages</option>
+                <option value="new">Reject new messages</option>
+              </select>
+            </Field>
+            <Field label="Compression">
+              <select className="input-enterprise" value={form.compression} onChange={set('compression')} disabled={form.storage === 'memory'}>
+                <option value="none">None</option>
+                <option value="s2">S2</option>
+              </select>
+            </Field>
+          </div>
+
+          <div className="grid gap-2 sm:grid-cols-2">
+            <Toggle checked={form.allow_direct} onChange={set('allow_direct')} label="Allow direct get" hint="Faster reads of individual messages" />
+            <Toggle checked={form.allow_rollup_hdrs} onChange={set('allow_rollup_hdrs')} label="Allow rollups" hint="Nats-Rollup header can purge a subject" />
+            <Toggle checked={form.deny_delete} onChange={set('deny_delete')} label="Deny message delete" hint="Block deleting messages via the API" />
+            <Toggle checked={form.deny_purge} onChange={set('deny_purge')} label="Deny purge" hint="Block purging via the API" />
+            <Toggle checked={form.discard_new_per_subject} onChange={set('discard_new_per_subject')} disabled={form.discard !== 'new'} label="Discard new per subject" hint="Apply 'reject new' per subject (needs max msgs per subject)" />
+          </div>
+
+          <DialogFooter className="gap-2 pt-1">
+            <Button type="button" onClick={onClose} variant="outline" disabled={saving}>Cancel</Button>
+            <Button type="submit" disabled={saving}>{saving ? 'Saving…' : creating ? 'Create stream' : 'Save changes'}</Button>
+          </DialogFooter>
         </form>
       </DialogContent>
     </Dialog>

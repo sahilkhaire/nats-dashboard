@@ -1,8 +1,10 @@
 import { useNavigate } from 'react-router-dom'
 import { GitMerge }   from 'lucide-react'
+import { useChartTheme } from '../../../../components/charts/TimeSeriesChart'
 
 export function RelationsTab({ stream, allStreams }) {
   const navigate = useNavigate()
+  const theme = useChartTheme()
   const name  = stream.name
   const cfg   = stream.config || {}
 
@@ -49,7 +51,7 @@ export function RelationsTab({ stream, allStreams }) {
 
   if (nodes.length === 1) {
     return (
-      <div className="space-y-2 rounded-lg border border-border bg-card p-10 text-center">
+      <div className="surface-card space-y-2 p-10 text-center">
         <GitMerge size={32} className="mx-auto text-muted-foreground" />
         <p className="text-sm text-muted-foreground">No relations found for this stream.</p>
         <p className="text-xs text-muted-foreground">Configure a mirror, sources, or republish to see relationships here.</p>
@@ -76,20 +78,21 @@ export function RelationsTab({ stream, allStreams }) {
     pos[n.id] = { x: CX + 220, y: CY - offset + i * gap }
   })
 
-  const typeColor = { current: '#00c8b4', stream: '#4d8ff5', external: '#f5a623', subject: '#a78bfa' }
+  const typeColor = { current: theme.series[0], stream: theme.series[2], external: theme.series[3], subject: theme.series[1] }
+  const typeLabel = { current: 'This stream', stream: 'Other stream (click to open)', external: 'External / unknown', subject: 'Republish subject' }
 
   return (
-    <div className="overflow-hidden rounded-lg border border-border bg-card">
-      <div className="flex items-center gap-2 border-b border-border bg-card px-4 py-3">
+    <div className="surface-card overflow-hidden">
+      <div className="card-header">
         <GitMerge size={14} className="text-primary" />
         <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Stream Relations</span>
         <span className="ml-auto text-xs text-muted-foreground">{edges.length} relation{edges.length !== 1 ? 's' : ''}</span>
       </div>
-      <div className="bg-background p-4">
+      <div className="p-4">
         <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: '300px' }}>
           <defs>
             <marker id="rel-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
-              <polygon points="0 0, 8 3, 0 6" fill="#4d5278" />
+              <polygon points="0 0, 8 3, 0 6" fill={theme.axis} />
             </marker>
           </defs>
 
@@ -103,8 +106,8 @@ export function RelationsTab({ stream, allStreams }) {
             const mx = (x1 + x2) / 2; const my = Math.min(y1, y2) - 10
             return (
               <g key={i}>
-                <path d={`M ${x1} ${y1} Q ${mx} ${my} ${x2} ${y2}`} fill="none" stroke="#2d3148" strokeWidth="1.5" markerEnd="url(#rel-arrow)" />
-                <text x={(x1 + x2) / 2} y={(y1 + y2) / 2 - 6} textAnchor="middle" fill="#8b92b3" fontSize="9" style={{ fontFamily: 'sans-serif' }}>
+                <path d={`M ${x1} ${y1} Q ${mx} ${my} ${x2} ${y2}`} fill="none" stroke={theme.axis} strokeWidth="1.5" markerEnd="url(#rel-arrow)" />
+                <text x={(x1 + x2) / 2} y={(y1 + y2) / 2 - 6} textAnchor="middle" fill={theme.muted} fontSize="10" style={{ fontFamily: 'sans-serif' }}>
                   {e.label}
                 </text>
               </g>
@@ -113,7 +116,7 @@ export function RelationsTab({ stream, allStreams }) {
 
           {nodes.map(n => {
             const p = pos[n.id]; if (!p) return null
-            const color     = typeColor[n.type] || '#4d5278'
+            const color     = typeColor[n.type] || theme.axis
             const clickable = n.type === 'stream'
             const label     = n.label.length > 18 ? n.label.slice(0, 17) + '…' : n.label
             return (
@@ -122,8 +125,8 @@ export function RelationsTab({ stream, allStreams }) {
                 style={{ cursor: clickable ? 'pointer' : 'default' }}
                 onClick={() => clickable && navigate(`/streams/${encodeURIComponent(n.id)}`)}
               >
-                <rect width={NW} height={NH} rx="6" fill={n.type === 'current' ? `${color}1a` : '#1a1d27'} stroke={color} strokeWidth={n.type === 'current' ? '2' : '1'} />
-                <text x={NW / 2} y={NH / 2 + 4} textAnchor="middle" fill={n.type === 'current' ? color : '#d1d5db'} fontSize="11" fontFamily="monospace" fontWeight={n.type === 'current' ? '600' : '400'}>
+                <rect width={NW} height={NH} rx="6" fill={theme.surface} stroke={color} strokeWidth={n.type === 'current' ? '2' : '1.25'} />
+                <text x={NW / 2} y={NH / 2 + 4} textAnchor="middle" fill={theme.text} fontSize="11" fontFamily="monospace" fontWeight={n.type === 'current' ? '600' : '400'}>
                   {label}
                 </text>
               </g>
@@ -132,14 +135,9 @@ export function RelationsTab({ stream, allStreams }) {
         </svg>
 
         <div className="mt-3 flex flex-wrap gap-4 border-t border-border pt-3 text-xs text-muted-foreground">
-          {[
-            { color: '#00c8b4', label: 'This stream' },
-            { color: '#4d8ff5', label: 'Other stream (click to open)' },
-            { color: '#f5a623', label: 'External / unknown' },
-            { color: '#a78bfa', label: 'Republish subject' },
-          ].map(({ color, label }) => (
+          {Object.keys(typeLabel).map((type) => ({ color: typeColor[type], label: typeLabel[type] })).map(({ color, label }) => (
             <div key={label} className="flex items-center gap-1.5">
-              <div className="w-3 h-3 rounded border" style={{ borderColor: color, background: `${color}22` }} />
+              <div className="h-3 w-3 rounded border-2" style={{ borderColor: color }} />
               {label}
             </div>
           ))}

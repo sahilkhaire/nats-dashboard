@@ -1,55 +1,45 @@
 /**
  * Publish routes:
  *   POST   /api/stream/publish       — publish or schedule a message
- *   GET    /api/stream/publishes     — list scheduled publishes for a stream
+ *   GET    /api/stream/publishes     — list scheduled publishes for a stream (on the current server)
  *   DELETE /api/stream/publish/:id   — cancel a scheduled publish
  */
 
-import { executePublish, schedulePublish, scheduledPublishes, serializePublish } from '../services/publish.js'
+import { executePublish, schedulePublish, scheduledPublishes, cancelPublish, serializePublish } from '../services/publish.js'
+import { readJsonBody, getQuery, sendJson, route, HttpError } from '../utils/http.js'
 
-export function registerPublishRoutes(router, { NATS_URL, NATS_TOKEN, readJsonBody }) {
-  router.post('/api/stream/publish', async (req, res) => {
-    res.setHeader('Content-Type', 'application/json')
-    try {
-      const body = await readJsonBody(req)
-      const { stream, subject, payload = '', headers: headersArr = [], scheduleAt, msgTtl, server: serverParam, token: tokenParam } = body
-      if (!stream || !subject) { res.statusCode = 400; res.end(JSON.stringify({ error: 'stream and subject are required' })); return }
-
-      const natsServer = serverParam || NATS_URL
-      const token      = tokenParam  || NATS_TOKEN
-      if (!natsServer) { res.statusCode = 400; res.end(JSON.stringify({ error: 'Missing server' })); return }
-
-      if (scheduleAt) {
-        const pub = schedulePublish({ stream, subject, payload, headers: headersArr, msgTtl: msgTtl || null, scheduleAt, natsServer, token })
-        res.statusCode = 201
-        res.end(JSON.stringify({ ok: true, scheduled: true, id: pub.id, scheduleAt }))
-      } else {
-        const result = await executePublish(natsServer, token, subject, payload, headersArr, msgTtl)
-        res.end(JSON.stringify({ ok: true, scheduled: false, ...result }))
-      }
-    } catch (err) {
-      res.statusCode = 502
-      res.end(JSON.stringify({ error: err.message || 'Publish failed' }))
+export function registerPublishRoutes(router, { conn }) {
+  router.post('/api/stream/publish', route(async (req, res) => {
+    const body = await readJsonBody(req)
+    const { stream, subject, payload = '', encoding, headers = [], scheduleAt, msgTtl, msgId } = body
+    if (!subject || typeof subject !== 'string' || /\s/.test(subject.trim()) || /[*>]/.test(subject)) {
+      throw new HttpError(400, 'A concrete subject is required (no spaces or wildcards)')
     }
-  })
+    const message = { stream, subject: subject.trim(), payload, encoding, headers, msgTtl: msgTtl || null, msgId: msgId || null }
+    const { natsUrl, token } = conn.resolve(req, body)
 
-  router.get('/api/stream/publishes', (req, res) => {
-    res.setHeader('Content-Type', 'application/json')
-    const url    = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
-    const stream = url.searchParams.get('stream')
-    const list   = [...scheduledPublishes.values()]
-      .filter(p => !stream || p.stream === stream)
+    if (scheduleAt) {
+      const ts = new Date(scheduleAt).getTime()
+      if (!Number.isFinite(ts)) throw new HttpError(400, 'scheduleAt must be a valid date')
+      const pub = schedulePublish({ ...message, scheduleAt, natsServer: natsUrl, token, serverKey: natsUrl })
+      sendJson(res, 201, { ok: true, scheduled: true, id: pub.id, scheduleAt: pub.scheduleAt })
+      return
+    }
+    const result = await executePublish(natsUrl, token, message)
+    sendJson(res, 200, { ok: true, scheduled: false, ...result })
+  }, 'Publish failed'))
+
+  router.get('/api/stream/publishes', route(async (req, res) => {
+    const query = getQuery(req)
+    const { natsUrl } = conn.resolve(req, query)
+    const list = [...scheduledPublishes.values()]
+      .filter((p) => p.serverKey === natsUrl && (!query.stream || p.stream === query.stream))
       .map(serializePublish)
-    res.end(JSON.stringify({ publishes: list }))
-  })
+    sendJson(res, 200, { publishes: list })
+  }))
 
-  router.delete('/api/stream/publish/:id', (req, res) => {
-    res.setHeader('Content-Type', 'application/json')
-    const id = req.url.split('/').pop().split('?')[0]
-    const p  = scheduledPublishes.get(id)
-    if (!p) { res.statusCode = 404; res.end(JSON.stringify({ error: 'Publish not found' })); return }
-    if (p.timerId) clearTimeout(p.timerId)
-    scheduledPublishes.delete(id)
-    res.end(JSON.stringify({ ok: true }))
-  })
+  router.delete('/api/stream/publish/:id', route(async (req, res) => {
+    if (!cancelPublish(req.params.id)) throw new HttpError(404, 'Scheduled publish not found')
+    sendJson(res, 200, { ok: true })
+  }))
 }

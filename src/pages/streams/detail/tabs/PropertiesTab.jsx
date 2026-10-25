@@ -8,6 +8,21 @@ import { KVRow }                                   from '../components/KVRow'
 import { MetadataSection }                         from '../components/MetadataSection'
 import { RoutingSection }                          from '../components/RoutingSection'
 
+/** Integer limit where empty / 0 / -1 mean unlimited. Throws on garbage instead of silently going unlimited. */
+const parseLimit = (v) => {
+  const t = String(v ?? '').trim()
+  if (t === '' || t === '-1' || t === '0') return -1
+  const n = Number(t)
+  if (!Number.isInteger(n) || n < 0) throw new Error('Enter a whole number (empty = unlimited)')
+  return n
+}
+
+const parseDuration = (example) => (v) => {
+  const ns = parseDurationToNs(v)
+  if (ns === null) throw new Error(`Invalid duration (e.g. ${example})`)
+  return ns
+}
+
 export function PropertiesTab({ stream, onUpdate }) {
   const cfg   = stream.config || {}
   const state = stream.state  || {}
@@ -52,12 +67,12 @@ export function PropertiesTab({ stream, onUpdate }) {
     {
       title: 'Limits',
       rows: [
-        { label: 'Max Messages',       value: cfg.max_msgs?.toString()     ?? '-1',  displayValue: unlim(cfg.max_msgs),     editable: true, inputType: 'number', onSave: makeUpdater('max_msgs',     v => parseInt(v, 10) || -1) },
-        { label: 'Max Bytes',          value: cfg.max_bytes?.toString()    ?? '-1',  displayValue: (cfg.max_bytes == null || cfg.max_bytes <= 0) ? 'Unlimited' : formatBytes(cfg.max_bytes),  editable: true, inputType: 'number', onSave: makeUpdater('max_bytes',    v => parseInt(v, 10) || -1) },
-        { label: 'Max Message Size',   value: cfg.max_msg_size?.toString() ?? '-1',  displayValue: (cfg.max_msg_size == null || cfg.max_msg_size <= 0) ? 'Unlimited' : formatBytes(cfg.max_msg_size), editable: true, inputType: 'number', onSave: makeUpdater('max_msg_size', v => parseInt(v, 10) || -1) },
-        { label: 'Max Age',            value: nsToDuration(cfg.max_age),   displayValue: !cfg.max_age || cfg.max_age === 0 ? 'Unlimited' : nsToDuration(cfg.max_age), editable: true, onSave: makeUpdater('max_age', v => { const ns = parseDurationToNs(v); if (ns === null) throw new Error('Invalid duration (e.g. 24h, 7d, 30m)'); return ns }) },
-        { label: 'Max Consumers',      value: cfg.max_consumers?.toString()         ?? '-1', displayValue: unlim(cfg.max_consumers),         editable: true, inputType: 'number', onSave: makeUpdater('max_consumers',         v => parseInt(v, 10) || -1) },
-        { label: 'Max Msgs per Subject', value: cfg.max_msgs_per_subject?.toString() ?? '-1', displayValue: unlim(cfg.max_msgs_per_subject),  editable: true, inputType: 'number', onSave: makeUpdater('max_msgs_per_subject', v => parseInt(v, 10) || -1) },
+        { label: 'Max Messages',       value: cfg.max_msgs?.toString()     ?? '-1',  displayValue: unlim(cfg.max_msgs),     editable: true, inputType: 'number', onSave: makeUpdater('max_msgs',     parseLimit) },
+        { label: 'Max Bytes',          value: cfg.max_bytes?.toString()    ?? '-1',  displayValue: (cfg.max_bytes == null || cfg.max_bytes <= 0) ? 'Unlimited' : formatBytes(cfg.max_bytes),  editable: true, inputType: 'number', onSave: makeUpdater('max_bytes',    parseLimit) },
+        { label: 'Max Message Size',   value: cfg.max_msg_size?.toString() ?? '-1',  displayValue: (cfg.max_msg_size == null || cfg.max_msg_size <= 0) ? 'Unlimited' : formatBytes(cfg.max_msg_size), editable: true, inputType: 'number', onSave: makeUpdater('max_msg_size', parseLimit) },
+        { label: 'Max Age',            value: cfg.max_age ? nsToDuration(cfg.max_age) : '',   displayValue: !cfg.max_age || cfg.max_age === 0 ? 'Unlimited' : nsToDuration(cfg.max_age), editable: true, onSave: makeUpdater('max_age', parseDuration('24h, 7d, 1h30m')) },
+        { label: 'Max Consumers',      value: cfg.max_consumers?.toString()         ?? '-1', displayValue: unlim(cfg.max_consumers),         editable: true, inputType: 'number', onSave: makeUpdater('max_consumers',         parseLimit) },
+        { label: 'Max Msgs per Subject', value: cfg.max_msgs_per_subject?.toString() ?? '-1', displayValue: unlim(cfg.max_msgs_per_subject),  editable: true, inputType: 'number', onSave: makeUpdater('max_msgs_per_subject', parseLimit) },
       ],
     },
     {
@@ -82,7 +97,7 @@ export function PropertiesTab({ stream, onUpdate }) {
           onSave: makeUpdater('num_replicas', v => { const n = parseInt(v, 10); if (isNaN(n) || n < 1 || n > 5) throw new Error('Replicas must be 1–5'); return n }),
         },
         { label: 'First Sequence',    value: (cfg.first_seq || 1).toLocaleString(), editable: false },
-        { label: 'Duplicate Window',  value: nsToDuration(cfg.duplicate_window), displayValue: !cfg.duplicate_window ? 'Default (2m)' : nsToDuration(cfg.duplicate_window), editable: true, onSave: makeUpdater('duplicate_window', v => { const ns = parseDurationToNs(v); if (ns === null) throw new Error('Invalid duration (e.g. 2m, 1h)'); return ns }) },
+        { label: 'Duplicate Window',  value: nsToDuration(cfg.duplicate_window), displayValue: !cfg.duplicate_window ? 'Default (2m)' : nsToDuration(cfg.duplicate_window), editable: true, onSave: makeUpdater('duplicate_window', parseDuration('2m, 1h')) },
       ],
     },
     {
@@ -101,7 +116,7 @@ export function PropertiesTab({ stream, onUpdate }) {
       title: 'Features (2.11+)',
       rows: [
         { label: 'Allow Msg TTL',              value: cfg.allow_msg_ttl      ? 'true' : 'false', displayValue: cfg.allow_msg_ttl ? <span className="text-nats-ok text-xs font-medium">Enabled — publishers may set Nats-Msg-Ttl header</span> : <span className="text-xs text-muted-foreground">Disabled</span>, editable: true, options: ['false', 'true'], onSave: makeUpdater('allow_msg_ttl',      v => v === 'true') },
-        { label: 'Subject Delete Marker TTL',  value: nsToDuration(cfg.subject_delete_marker_ttl), displayValue: !cfg.subject_delete_marker_ttl ? <span className="text-xs text-muted-foreground">Disabled</span> : nsToDuration(cfg.subject_delete_marker_ttl), editable: true, onSave: makeUpdater('subject_delete_marker_ttl', v => { if (!v || v === '0') return 0; const ns = parseDurationToNs(v); if (ns === null) throw new Error('Invalid duration (e.g. 5m, 1h)'); return ns }) },
+        { label: 'Subject Delete Marker TTL',  value: nsToDuration(cfg.subject_delete_marker_ttl), displayValue: !cfg.subject_delete_marker_ttl ? <span className="text-xs text-muted-foreground">Disabled</span> : nsToDuration(cfg.subject_delete_marker_ttl), editable: true, onSave: makeUpdater('subject_delete_marker_ttl', parseDuration('5m, 1h')) },
         { label: 'Allow Msg Counter',          value: cfg.allow_msg_counter  ? 'true' : 'false', displayValue: <BoolBadge value={cfg.allow_msg_counter}  />, editable: true, options: ['false', 'true'], onSave: makeUpdater('allow_msg_counter',  v => v === 'true') },
         { label: 'Allow Atomic Publish',       value: cfg.allow_atomic       ? 'true' : 'false', displayValue: <BoolBadge value={cfg.allow_atomic}       />, editable: true, options: ['false', 'true'], onSave: makeUpdater('allow_atomic',       v => v === 'true') },
         { label: 'Allow Msg Schedules',        value: cfg.allow_msg_schedules ? 'true' : 'false', displayValue: <BoolBadge value={cfg.allow_msg_schedules} />, editable: true, options: ['false', 'true'], onSave: makeUpdater('allow_msg_schedules', v => v === 'true') },
@@ -111,9 +126,9 @@ export function PropertiesTab({ stream, onUpdate }) {
     {
       title: 'Consumer Limits',
       rows: [
-        { label: 'Max Ack Pending',    value: cl.max_ack_pending?.toString() ?? '', displayValue: unlim(cl.max_ack_pending),    editable: true, inputType: 'number', onSave: makeNestedUpdater('consumer_limits', 'max_ack_pending',    v => parseInt(v, 10) || -1) },
-        { label: 'Max Deliver',        value: cl.max_deliver?.toString()     ?? '', displayValue: unlim(cl.max_deliver),        editable: true, inputType: 'number', onSave: makeNestedUpdater('consumer_limits', 'max_deliver',        v => parseInt(v, 10) || -1) },
-        { label: 'Inactive Threshold', value: nsToDuration(cl.inactive_threshold), displayValue: !cl.inactive_threshold ? 'Default' : nsToDuration(cl.inactive_threshold), editable: true, onSave: makeNestedUpdater('consumer_limits', 'inactive_threshold', v => { if (!v || v === '0') return 0; const ns = parseDurationToNs(v); if (ns === null) throw new Error('Invalid duration (e.g. 5m, 1h)'); return ns }) },
+        { label: 'Max Ack Pending',    value: cl.max_ack_pending?.toString() ?? '', displayValue: unlim(cl.max_ack_pending),    editable: true, inputType: 'number', onSave: makeNestedUpdater('consumer_limits', 'max_ack_pending',    parseLimit) },
+        { label: 'Max Deliver',        value: cl.max_deliver?.toString()     ?? '', displayValue: unlim(cl.max_deliver),        editable: true, inputType: 'number', onSave: makeNestedUpdater('consumer_limits', 'max_deliver',        parseLimit) },
+        { label: 'Inactive Threshold', value: nsToDuration(cl.inactive_threshold), displayValue: !cl.inactive_threshold ? 'Default' : nsToDuration(cl.inactive_threshold), editable: true, onSave: makeNestedUpdater('consumer_limits', 'inactive_threshold', parseDuration('5m, 1h')) },
       ],
     },
     {
@@ -135,13 +150,16 @@ export function PropertiesTab({ stream, onUpdate }) {
 
   return (
     <div className="space-y-4">
+      {cfg.sealed && (
+        <div className="rounded-lg border border-nats-warn/40 bg-nats-warn/10 px-4 py-3 text-sm text-nats-warn">This stream is sealed — its configuration can no longer be changed.</div>
+      )}
       {sections.map(section => (
-        <div key={section.title} className="overflow-hidden rounded-lg border border-border bg-card">
-          <div className="border-b border-border bg-card px-4 py-2.5">
-            <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">{section.title}</span>
+        <div key={section.title} className="surface-card overflow-hidden">
+          <div className="card-header">
+            <span className="card-title">{section.title}</span>
           </div>
           {section.rows.map(row => (
-            <PropertyRow key={row.label} {...row} />
+            <PropertyRow key={row.label} {...row} editable={row.editable && !cfg.sealed} />
           ))}
         </div>
       ))}

@@ -24,8 +24,8 @@ export function PropertyRow({ label, value, displayValue, editable, inputType = 
   }
 
   return (
-    <div className="group flex items-start justify-between border-b border-border px-4 py-3 transition-colors hover:bg-muted/20 last:border-0">
-      <div className="w-44 shrink-0 pt-0.5 text-sm text-muted-foreground">{label}</div>
+    <div className="group flex flex-col gap-1 border-b border-border px-4 py-2.5 transition-colors last:border-0 hover:bg-muted/30 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
+      <div className="shrink-0 pt-0.5 text-sm text-muted-foreground sm:w-52">{label}</div>
       <div className="flex-1 min-w-0">
         {editing ? (
           <div className="flex items-center gap-2">
@@ -33,8 +33,9 @@ export function PropertyRow({ label, value, displayValue, editable, inputType = 
               <select
                 value={draft}
                 onChange={e => setDraft(e.target.value)}
-                className="input-enterprise px-2 py-1 text-sm"
+                className="input-enterprise h-8 w-auto text-sm"
                 autoFocus
+                onKeyDown={e => { if (e.key === 'Enter') save(); if (e.key === 'Escape') cancel() }}
               >
                 {options.map(o => <option key={o} value={o}>{o}</option>)}
               </select>
@@ -43,12 +44,12 @@ export function PropertyRow({ label, value, displayValue, editable, inputType = 
                 type={inputType}
                 value={draft}
                 onChange={e => setDraft(e.target.value)}
-                className="input-enterprise w-full px-2 py-1 text-sm font-mono"
+                className="input-enterprise h-8 w-full font-mono text-sm"
                 autoFocus
                 onKeyDown={e => { if (e.key === 'Enter') save(); if (e.key === 'Escape') cancel() }}
               />
             )}
-            <button onClick={save} disabled={saving} className="p-1 rounded hover:bg-nats-ok/20 text-nats-ok" title="Save">
+            <button onClick={save} disabled={saving} className="rounded p-1 text-nats-ok hover:bg-nats-ok/15 disabled:opacity-50" title="Save (Enter)">
               <Check size={14} />
             </button>
             <button onClick={cancel} className="rounded p-1 text-muted-foreground hover:bg-muted" title="Cancel">
@@ -61,7 +62,7 @@ export function PropertyRow({ label, value, displayValue, editable, inputType = 
             {editable && (
               <button
                 onClick={startEdit}
-                className="rounded p-1 text-muted-foreground opacity-0 transition-all hover:bg-muted hover:text-primary group-hover:opacity-100"
+                className="rounded p-1 text-muted-foreground opacity-40 transition-all hover:bg-muted hover:text-primary focus-visible:opacity-100 group-hover:opacity-100"
                 title={`Edit ${label}`}
               >
                 <Pencil size={12} />

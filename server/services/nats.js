@@ -4,40 +4,117 @@
  */
 
 import { connect, StringCodec } from 'nats'
-import { parseQuery } from '../utils/http.js'
+import { parseQuery, HttpError } from '../utils/http.js'
 
 const sc = StringCodec()
 const pool = new Map()
+const pending = new Map()
 
-export async function getConn(natsUrl, token) {
-  let url = natsUrl
-  if (url.startsWith('http://')) {
-    const u = new URL(url)
-    url = `nats://${u.hostname}:4222`
-  } else if (url.startsWith('https://')) {
-    const u = new URL(url)
-    url = `nats://${u.hostname}:4222`
+const CONNECT_TIMEOUT_MS = 5000
+
+/**
+ * Convert any server URL the UI may hold into a NATS protocol URL.
+ * HTTP monitoring URLs (http://host:8222) map to the default client port on the same host.
+ */
+export function toNatsUrl(url) {
+  if (!url || typeof url !== 'string') return null
+  const trimmed = url.trim()
+  if (/^(nats|tls|ws|wss):\/\//i.test(trimmed)) return trimmed
+  if (/^https?:\/\//i.test(trimmed)) {
+    try {
+      const u = new URL(trimmed)
+      return `nats://${u.hostname}:4222`
+    } catch {
+      return null
+    }
   }
-
-  const key = `${url}::${token || ''}`
-  let nc = pool.get(key)
-  if (nc && !nc.isClosed()) return nc
-
-  const opts = { servers: url, reconnect: true, reconnectTimeWait: 2000, maxReconnectAttempts: 5 }
-  if (token) opts.token = token
-
-  nc = await connect(opts)
-  pool.set(key, nc)
-  nc.closed().then(() => pool.delete(key))
-  return nc
+  // bare host[:port]
+  return `nats://${trimmed}`
 }
 
-export async function natsRequest(nc, subject, data = {}) {
-  const msg = await nc.request(subject, sc.encode(JSON.stringify(data)), { timeout: 10000 })
+/** Convert a NATS protocol URL into the conventional HTTP monitoring URL. */
+export function toMonitoringUrl(natsUrl) {
+  if (!natsUrl || typeof natsUrl !== 'string') return null
+  if (/^https?:\/\//i.test(natsUrl)) return natsUrl
+  try {
+    const u = new URL(natsUrl)
+    return `http://${u.hostname}:8222`
+  } catch {
+    return null
+  }
+}
+
+/**
+ * @param {string} natsUrl
+ * @param {string|{token?:string,user?:string,pass?:string}|null} credentials — a token string or a credentials object
+ */
+export async function getConn(natsUrl, credentials) {
+  const url = toNatsUrl(natsUrl)
+  if (!url) throw new HttpError(400, 'Missing NATS server URL')
+
+  const creds = typeof credentials === 'string' ? { token: credentials } : (credentials || {})
+  const key = `${url}::${creds.token || ''}::${creds.user || ''}::${creds.pass || ''}`
+  const existing = pool.get(key)
+  if (existing && !existing.isClosed()) return existing
+  if (pending.has(key)) return pending.get(key)
+
+  const opts = {
+    servers: url,
+    name: 'nats-dashboard',
+    reconnect: true,
+    reconnectTimeWait: 2000,
+    maxReconnectAttempts: 10,
+    timeout: CONNECT_TIMEOUT_MS,
+  }
+  if (creds.token) opts.token = creds.token
+  if (creds.user) {
+    opts.user = creds.user
+    opts.pass = creds.pass || ''
+  }
+
+  const promise = connect(opts)
+    .then((nc) => {
+      pool.set(key, nc)
+      nc.closed().then(() => {
+        if (pool.get(key) === nc) pool.delete(key)
+      })
+      return nc
+    })
+    .finally(() => pending.delete(key))
+
+  pending.set(key, promise)
+  return promise
+}
+
+export async function natsRequest(nc, subject, data = {}, timeout = 10000) {
+  const msg = await nc.request(subject, sc.encode(JSON.stringify(data)), { timeout })
   return JSON.parse(sc.decode(msg.data))
 }
 
-// ─── Monitoring handlers ───────────────────────────────────────────────────────
+/** Run a JetStream API request and throw a readable error on API failure. */
+export async function jsApi(nc, subject, data = {}, fallback = 'JetStream API error') {
+  const resp = await natsRequest(nc, subject, data)
+  if (resp?.error) {
+    const status = resp.error.code === 404 ? 404 : resp.error.code === 400 ? 400 : 502
+    throw new HttpError(status, resp.error.description || fallback)
+  }
+  return resp
+}
+
+/**
+ * JetStream asset names (streams, consumers, buckets) become NATS subject tokens,
+ * so they must not contain whitespace, '.', '*', '>' or path separators.
+ */
+const NAME_RE = /^[^\s.*>/\\\0]+$/
+
+export function assertName(value, label = 'name') {
+  if (typeof value !== 'string' || !value || value.length > 255 || !NAME_RE.test(value)) {
+    throw new HttpError(400, `Invalid ${label}: must be non-empty and cannot contain spaces, '.', '*', '>' or path separators`)
+  }
+  return value
+}
+
+// ─── Monitoring handlers (NATS protocol fallback) ─────────────────────────────
 
 async function handleVarz(nc) {
   const info = nc.info || {}
@@ -51,8 +128,9 @@ async function handleVarz(nc) {
     auth_required: info.auth_required,
     tls_required: info.tls_required,
     max_payload: info.max_payload,
-    max_connections: info.max_connections || 65536,
+    max_connections: null,
     jetstream: info.jetstream,
+    cluster: info.cluster ? { name: info.cluster } : undefined,
     uptime: null,
     connections: null,
     slow_consumers: null,
@@ -65,13 +143,31 @@ async function handleVarz(nc) {
     mem: null,
     now: new Date().toISOString(),
     _via: 'nats_protocol',
-    _note: 'Connected via NATS protocol (port 4222). CPU/mem/connection metrics require HTTP monitoring port 8222.',
   }
 }
 
 async function handleHealthz(nc) {
-  if (!nc.isClosed()) return { status: 'ok' }
-  return { status: 'unavailable' }
+  if (nc.isClosed()) return { status: 'unavailable' }
+  try {
+    await nc.flush()
+    return { status: 'ok' }
+  } catch {
+    return { status: 'unavailable' }
+  }
+}
+
+async function listAll(nc, subject, key) {
+  const out = []
+  let offset = 0
+  for (;;) {
+    const resp = await natsRequest(nc, subject, { offset })
+    if (resp.error) throw new Error(resp.error.description || 'JetStream API error')
+    const page = resp[key] || []
+    out.push(...page)
+    offset += page.length
+    if (!page.length || offset >= (resp.total ?? 0)) break
+  }
+  return out
 }
 
 async function handleJsz(nc, options = {}) {
@@ -101,11 +197,14 @@ async function handleJsz(nc, options = {}) {
   }
 
   if (options.streams || options.accounts) {
-    const listResp = await natsRequest(nc, '$JS.API.STREAM.LIST', { offset: 0 })
-    const streams = listResp.streams || []
+    const streams = await listAll(nc, '$JS.API.STREAM.LIST', 'streams')
+    let totalMessages = 0
+    let totalBytes = 0
 
     const streamDetails = await Promise.all(
       streams.map(async (s) => {
+        totalMessages += s.state?.messages ?? 0
+        totalBytes += s.state?.bytes ?? 0
         const detail = {
           name: s.config.name,
           created: s.created,
@@ -116,8 +215,7 @@ async function handleJsz(nc, options = {}) {
         }
         if (options.consumers) {
           try {
-            const cListResp = await natsRequest(nc, `$JS.API.CONSUMER.LIST.${s.config.name}`, { offset: 0 })
-            detail.consumer_detail = cListResp.consumers || []
+            detail.consumer_detail = await listAll(nc, `$JS.API.CONSUMER.LIST.${s.config.name}`, 'consumers')
           } catch {
             detail.consumer_detail = []
           }
@@ -125,6 +223,8 @@ async function handleJsz(nc, options = {}) {
         return detail
       })
     )
+    result.total_messages ??= totalMessages
+    result.total_message_bytes ??= totalBytes
     result.account_details = [{ name: 'default', stream_detail: streamDetails }]
   }
   return result
@@ -132,7 +232,7 @@ async function handleJsz(nc, options = {}) {
 
 export const NOT_AVAILABLE = (endpoint) => ({
   _via: 'nats_protocol',
-  _note: `${endpoint} requires HTTP monitoring port 8222 or NATS system account.`,
+  _note: `/${endpoint} requires the HTTP monitoring port (8222). Add the connection with an http:// monitoring URL to see it.`,
   _unavailable: true,
 })
 
@@ -147,13 +247,14 @@ export async function handlePath(nc, path) {
       streams:  options.streams  === 'true',
       consumers: options.consumers === 'true',
     })
-    case 'connz':    return NOT_AVAILABLE('connz')
-    case 'routez':   return NOT_AVAILABLE('routez')
-    case 'gatewayz': return NOT_AVAILABLE('gatewayz')
-    case 'leafz':    return NOT_AVAILABLE('leafz')
-    case 'subsz':    return NOT_AVAILABLE('subsz')
-    case 'accountz': return NOT_AVAILABLE('accountz')
-    case 'accstatz': return NOT_AVAILABLE('accstatz')
-    default: throw new Error(`Unknown endpoint: ${endpoint}`)
+    case 'connz':
+    case 'routez':
+    case 'gatewayz':
+    case 'leafz':
+    case 'subsz':
+    case 'accountz':
+    case 'accstatz':
+      return NOT_AVAILABLE(endpoint)
+    default: throw new HttpError(404, `Unknown endpoint: ${endpoint}`)
   }
 }

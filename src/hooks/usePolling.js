@@ -1,74 +1,32 @@
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { peek, subscribe, refetch as refetchKey, EMPTY_POLL_STATE } from '../lib/poller'
 
+/**
+ * Poll a JSON URL. Components polling the same URL share one request loop (see lib/poller).
+ *
+ * @returns {{ data, error, lastFetch, prevFetch, loading, refetch }}
+ */
 export function usePolling(url, interval, options = {}) {
-  const { enabled = true, onSuccess, onError, headers } = options
-  const [data, setData] = useState(null)
-  const [error, setError] = useState(null)
-  const [lastFetch, setLastFetch] = useState(null)
+  const { enabled = true, headers } = options
+  const authHeader = headers?.Authorization || ''
+  const key = url ? `${url}::${authHeader}` : null
+  const stableHeaders = useMemo(() => (authHeader ? { Authorization: authHeader } : undefined), [authHeader])
 
-  // Store headers in a ref so changes don't restart the polling loop
-  const headersRef = useRef(headers)
-  const lastErrorRef = useRef('')
-  const lastWarningRef = useRef('')
-  headersRef.current = headers
-
-  const fetchData = useCallback(async (signal) => {
-    if (!url || !enabled) return
-    try {
-      const fetchOpts = { credentials: 'include' }
-      if (signal) fetchOpts.signal = signal
-      if (headersRef.current) fetchOpts.headers = headersRef.current
-      const res = await fetch(url, fetchOpts)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const json = await res.json()
-      setData(json)
-      setError(null)
-      lastErrorRef.current = ''
-      setLastFetch(Date.now())
-      if (json?._unavailable || json?._note) {
-        const warningMsg = json._note || 'Some monitoring information is unavailable.'
-        if (lastWarningRef.current !== warningMsg) {
-          lastWarningRef.current = warningMsg
-          window.dispatchEvent(new CustomEvent('app-notify', {
-            detail: {
-              level: 'warning',
-              title: 'Monitoring warning',
-              message: warningMsg,
-              source: 'polling',
-            },
-          }))
-        }
-      }
-      onSuccess?.(json)
-    } catch (e) {
-      if (e.name === 'AbortError') return // request cancelled due to URL change, ignore
-      setError(e.message)
-      if (lastErrorRef.current !== e.message) {
-        lastErrorRef.current = e.message
-        window.dispatchEvent(new CustomEvent('app-notify', {
-          detail: {
-            level: 'error',
-            title: 'Request failed',
-            message: e.message || 'Unexpected polling error',
-            source: 'polling',
-          },
-        }))
-      }
-      if (e.message === 'HTTP 401') window.dispatchEvent(new CustomEvent('auth-required'))
-      onError?.(e)
-    }
-  }, [url, enabled, onSuccess, onError])
+  const [state, setState] = useState(() => (key ? peek(key) : EMPTY_POLL_STATE))
 
   useEffect(() => {
-    const controller = new AbortController()
-    const { signal } = controller
-    fetchData(signal)
-    const timer = setInterval(() => fetchData(signal), interval)
-    return () => {
-      controller.abort() // cancel any in-flight requests when URL/interval changes
-      clearInterval(timer)
+    if (!key) {
+      setState(EMPTY_POLL_STATE)
+      return undefined
     }
-  }, [fetchData, interval])
+    // Show cached data for this URL (or nothing) immediately — never another URL's data.
+    setState(peek(key))
+    return subscribe(key, url, stableHeaders, { interval, enabled }, setState)
+  }, [key, url, stableHeaders, interval, enabled])
 
-  return { data, error, lastFetch, refetch: () => fetchData() }
+  const refetch = useCallback(() => {
+    if (key) refetchKey(key)
+  }, [key])
+
+  return { ...state, refetch }
 }

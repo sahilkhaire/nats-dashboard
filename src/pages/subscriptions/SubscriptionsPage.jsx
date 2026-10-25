@@ -3,10 +3,11 @@ import { useSearchParams } from 'react-router-dom'
 import { useNatsPolling } from '../../hooks/useNatsPolling'
 import { useTableSort } from '../../hooks/useTableSort'
 import { usePagination } from '../../hooks/usePagination'
-import { MetricCard } from '../../components/MetricCard'
-import { AlertBanner } from '../../components/AlertBanner'
-import { NatsProtocolNotice } from '../../components/NatsProtocolNotice'
-import { SortableTh } from '../../components/ui'
+import { MetricCard } from '../../components/ui/MetricCard'
+import { SortableTh } from '../../components/ui/SortableTh'
+import { PageHeader } from '../../components/shared/PageHeader'
+import { PollState } from '../../components/shared/PageState'
+import { Radio as PageIcon } from 'lucide-react'
 import { PaginationBar } from '../../components/shared/PaginationBar'
 import { Database, Server, Layers, Search } from 'lucide-react'
 
@@ -22,13 +23,13 @@ function getFilterCategory(subject) {
   return FILTER_APP
 }
 
-export function SubscriptionsPage() {
+function SubscriptionsPageBody() {
   const [searchParams, setSearchParams] = useSearchParams()
   const urlFilter = searchParams.get('filter') || FILTER_ALL
   const [filter, setFilter] = useState(urlFilter)
   const [search, setSearch] = useState('')
 
-  const { data, error } = useNatsPolling('/subsz?subs=1&limit=2000', 2000)
+  const { data, error, refetch } = useNatsPolling('/subsz?subs=1&limit=2000')
 
   const subs = data?.subscriptions_list ?? []
   const counts = useMemo(() => {
@@ -84,9 +85,6 @@ export function SubscriptionsPage() {
     setSearchParams(f === FILTER_ALL ? {} : { filter: f })
   }
 
-  if (data?._unavailable) return <NatsProtocolNotice endpoint="subsz" />
-  if (error) return <div className="p-6"><AlertBanner variant="error" title="Error">{error}</AlertBanner></div>
-  if (!data) return <div className="p-6 text-nats-text-secondary">Loading...</div>
 
   return (
     <div className="space-y-6">
@@ -231,6 +229,18 @@ export function SubscriptionsPage() {
           </div>
         )}
       </div>
+    </div>
+  )
+}
+
+export function SubscriptionsPage() {
+  const { data, error, refetch } = useNatsPolling('/subsz?subs=1&limit=2000')
+  return (
+    <div>
+      <PageHeader title="Subscriptions" icon={PageIcon} description="Subject interest registered on this server" />
+      <PollState data={data} error={error} onRetry={refetch} endpoint="subsz">
+        {data && <SubscriptionsPageBody />}
+      </PollState>
     </div>
   )
 }

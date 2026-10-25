@@ -1,218 +1,142 @@
 import { useEffect, useRef, useState } from 'react'
+import { Loader2, TerminalSquare, Trash2 } from 'lucide-react'
+import { useConfig } from '../../context/ConfigContext'
+import { Button } from '../../components/ui/button'
+import { CopyButton } from '../../components/shared/CopyButton'
+
+const HISTORY_KEY = 'nats-dashboard-cli-history'
+const EXAMPLES = ['nats stream ls', 'nats consumer ls ORDERS', 'nats kv ls', 'nats server info', 'nats account info', 'nats --help']
+
+function loadHistory() {
+  try {
+    const h = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]')
+    return Array.isArray(h) ? h.slice(-50) : []
+  } catch {
+    return []
+  }
+}
 
 export function CliPage() {
+  const { api, connection } = useConfig()
   const [command, setCommand] = useState('')
   const [running, setRunning] = useState(false)
-  const [history, setHistory] = useState([])
-  const [requestError, setRequestError] = useState('')
-  const terminalBodyRef = useRef(null)
+  const [entries, setEntries] = useState([])
+  const [history, setHistory] = useState(loadHistory)
+  const [cursor, setCursor] = useState(-1)
+  const bodyRef = useRef(null)
+  const inputRef = useRef(null)
 
+  useEffect(() => { document.title = 'CLI · NATS Dashboard' }, [])
   useEffect(() => {
-    if (!terminalBodyRef.current) return
-    terminalBodyRef.current.scrollTop = terminalBodyRef.current.scrollHeight
-  }, [history, running, requestError])
+    bodyRef.current?.scrollTo({ top: bodyRef.current.scrollHeight })
+  }, [entries, running])
 
-  const runCommand = async () => {
-    if (running) return
-    const trimmed = command.trim()
-    if (!trimmed) return
-
-    setRequestError('')
+  const run = async (raw = command) => {
+    const cmd = raw.trim()
+    if (!cmd || running) return
+    const full = cmd.startsWith('nats') ? cmd : `nats ${cmd}`
     setRunning(true)
+    setCommand('')
+    setCursor(-1)
+    const nextHistory = [...history.filter((h) => h !== full), full].slice(-50)
+    setHistory(nextHistory)
+    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(nextHistory)) } catch { /* ignore */ }
 
+    const entry = { id: Date.now(), command: full, at: new Date().toLocaleTimeString() }
     try {
-      const res = await fetch('/api/cli/nats', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ command: trimmed }),
-      })
-      const raw = await res.text()
-      let data = null
-      if (raw) {
-        try {
-          data = JSON.parse(raw)
-        } catch {
-          setRequestError(`Unexpected response from server (status ${res.status}).`)
-          setHistory((prev) => [
-            ...prev,
-            {
-              command: trimmed,
-              ok: false,
-              exitCode: null,
-              durationMs: 0,
-              stdout: '',
-              stderr: `Unexpected response from server (status ${res.status}).`,
-              validationError: null,
-              timestamp: new Date().toLocaleTimeString(),
-            },
-          ])
-          return
-        }
-      }
-
-      if (!res.ok) {
-        const errorMessage = data?.validationError || data?.error || `Request failed with status ${res.status}.`
-        setHistory((prev) => [
-          ...prev,
-          {
-            command: trimmed,
-            ok: false,
-            exitCode: data?.exitCode ?? null,
-            durationMs: data?.durationMs ?? 0,
-            stdout: data?.stdout || '',
-            stderr: data?.stderr || (!data?.validationError ? errorMessage : ''),
-            validationError: data?.validationError || null,
-            timestamp: new Date().toLocaleTimeString(),
-          },
-        ])
-        if (!data?.validationError) setRequestError(errorMessage)
-      } else {
-        if (!data) {
-          setRequestError(`Empty response from server (status ${res.status}).`)
-          setHistory((prev) => [
-            ...prev,
-            {
-              command: trimmed,
-              ok: false,
-              exitCode: null,
-              durationMs: 0,
-              stdout: '',
-              stderr: `Empty response from server (status ${res.status}).`,
-              validationError: null,
-              timestamp: new Date().toLocaleTimeString(),
-            },
-          ])
-          return
-        }
-        setHistory((prev) => [
-          ...prev,
-          {
-            command: trimmed,
-            ok: data.ok,
-            exitCode: data.exitCode ?? null,
-            durationMs: data.durationMs ?? 0,
-            stdout: data.stdout || '',
-            stderr: data.stderr || '',
-            validationError: data.validationError || null,
-            timestamp: new Date().toLocaleTimeString(),
-          },
-        ])
-      }
-      setCommand('')
+      const data = await api('/api/cli/nats', { method: 'POST', body: { command: full } })
+      setEntries((prev) => [...prev, { ...entry, ...data }])
     } catch (err) {
-      setRequestError(err.message || 'Failed to execute command.')
-      setHistory((prev) => [
-        ...prev,
-        {
-          command: trimmed,
-          ok: false,
-          exitCode: null,
-          durationMs: 0,
-          stdout: '',
-          stderr: err.message || 'Failed to execute command.',
-          validationError: null,
-          timestamp: new Date().toLocaleTimeString(),
-        },
-      ])
+      setEntries((prev) => [...prev, { ...entry, ok: false, validationError: err.data?.validationError, stderr: err.data?.validationError ? '' : err.message }])
     } finally {
       setRunning(false)
+      setTimeout(() => inputRef.current?.focus(), 0)
     }
   }
 
-  const onCommandKeyDown = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+  const onKeyDown = (e) => {
+    if (e.key === 'Enter') {
       e.preventDefault()
-      runCommand()
+      run()
+    } else if (e.key === 'ArrowUp' && history.length) {
+      e.preventDefault()
+      const next = cursor < 0 ? history.length - 1 : Math.max(0, cursor - 1)
+      setCursor(next)
+      setCommand(history[next])
+    } else if (e.key === 'ArrowDown' && cursor >= 0) {
+      e.preventDefault()
+      const next = cursor + 1
+      if (next >= history.length) { setCursor(-1); setCommand('') }
+      else { setCursor(next); setCommand(history[next]) }
+    } else if (e.key === 'l' && e.ctrlKey) {
+      e.preventDefault()
+      setEntries([])
     }
-  }
-
-  const clearTerminal = () => {
-    setHistory([])
-    setRequestError('')
   }
 
   return (
-    <div className="-m-6 h-[calc(100vh-4rem)] bg-[#0b1020] text-[#c6d0f5]">
-      <div className="flex h-full flex-col border-y border-white/10">
-        <div className="flex items-center justify-between border-b border-white/10 px-4 py-2">
-          <div className="text-xs font-mono uppercase tracking-wider text-[#8aadf4]">
-            NATS Terminal - Non-interactive mode (nats only)
-          </div>
-          <button
-            type="button"
-            onClick={clearTerminal}
-            className="rounded border border-white/20 px-2 py-1 text-xs font-mono text-[#8aadf4] transition-colors hover:bg-white/10"
-          >
-            clear
-          </button>
+    <div className="flex h-[calc(100vh-3.5rem)] flex-col">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3 sm:px-6">
+        <div className="flex min-w-0 items-center gap-2">
+          <TerminalSquare size={16} className="text-primary" />
+          <h1 className="text-sm font-semibold">NATS CLI</h1>
+          <span className="truncate text-xs text-muted-foreground">
+            runs on the dashboard host against <span className="font-mono text-foreground">{connection?.natsUrl || connection?.monitoringUrl || '—'}</span>
+          </span>
         </div>
+        <Button variant="ghost" size="sm" onClick={() => setEntries([])} disabled={!entries.length}><Trash2 size={13} /> Clear</Button>
+      </div>
 
-        <div ref={terminalBodyRef} className="flex-1 overflow-auto px-4 py-3 font-mono text-sm">
-          {history.length === 0 && (
-            <div className="space-y-1 text-[#9fb2e7]">
-              <div>Type a command and press Enter.</div>
-              <div>Examples: <span className="text-[#a6da95]">nats --help</span>, <span className="text-[#a6da95]">nats stream ls</span></div>
-            </div>
-          )}
-
-          {history.map((entry, idx) => (
-            <div key={`${entry.timestamp}-${idx}`} className="mb-5 space-y-2">
-              <div className="flex items-center gap-2 text-[#8aadf4]">
-                <span>$</span>
-                <span className="break-all text-[#a6da95]">{entry.command}</span>
-                <span className="text-xs text-[#7f849c]">{entry.timestamp}</span>
-              </div>
-
-              {entry.validationError ? (
-                <div className="rounded border border-[#f5a97f]/40 bg-[#f5a97f]/10 p-2 text-[#f5a97f]">
-                  blocked: {entry.validationError}
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  <div className="text-xs text-[#7f849c]">
-                    status={entry.ok ? 'success' : 'failed'} exit={entry.exitCode ?? 'n/a'} duration={entry.durationMs}ms
-                  </div>
-                  {entry.stdout && (
-                    <pre className="whitespace-pre-wrap rounded border border-white/10 bg-black/20 p-2 text-[#cad3f5]">{entry.stdout}</pre>
-                  )}
-                  {entry.stderr && (
-                    <pre className="whitespace-pre-wrap rounded border border-[#ed8796]/35 bg-[#ed8796]/10 p-2 text-[#ed8796]">{entry.stderr}</pre>
-                  )}
-                  {!entry.stdout && !entry.stderr && (
-                    <div className="text-[#7f849c]">No output</div>
-                  )}
-                </div>
-              )}
-            </div>
-          ))}
-
-          {requestError && (
-            <div className="rounded border border-[#ed8796]/35 bg-[#ed8796]/10 p-2 text-[#ed8796]">
-              {requestError}
-            </div>
-          )}
-          {running && (
-            <div className="mt-2 animate-pulse text-[#8aadf4]">Running...</div>
-          )}
-          <div className="mt-2 border-t border-white/10 pt-3">
-            <div className="flex items-center gap-2">
-              <span className="text-[#8aadf4]">$</span>
-              <input
-                id="cli-command"
-                value={command}
-                onChange={(e) => setCommand(e.target.value)}
-                onKeyDown={onCommandKeyDown}
-                placeholder="nats stream ls"
-                className="w-full bg-transparent text-[#cad3f5] outline-none placeholder:text-[#7f849c]"
-                disabled={running}
-                autoFocus
-              />
-            </div>
-            <div className="mt-1 text-xs text-[#7f849c]">
-              Enter to run. Allowed: nats commands only. No shell chaining/operators.
+      <div ref={bodyRef} className="min-h-0 flex-1 overflow-y-auto bg-muted/30 px-4 py-4 font-mono text-[13px] sm:px-6" onClick={() => inputRef.current?.focus()}>
+        {entries.length === 0 && (
+          <div className="space-y-3 text-muted-foreground">
+            <p>Run non-interactive <span className="text-foreground">nats</span> commands. Shell operators (pipes, &&, ;) are blocked. ↑/↓ browse history, Ctrl+L clears.</p>
+            <div className="flex flex-wrap gap-2">
+              {EXAMPLES.map((ex) => (
+                <button key={ex} type="button" onClick={(e) => { e.stopPropagation(); run(ex) }} className="chip hover:border-primary/50 hover:text-primary">{ex}</button>
+              ))}
             </div>
           </div>
+        )}
+        {entries.map((e) => (
+          <div key={e.id} className="mb-5">
+            <div className="flex items-center gap-2">
+              <span className="text-primary">$</span>
+              <span className="break-all text-foreground">{e.command}</span>
+              <span className="ml-auto shrink-0 text-[11px] text-muted-foreground">
+                {e.validationError ? 'blocked' : `${e.ok ? 'ok' : `exit ${e.exitCode ?? '?'}`} · ${e.durationMs ?? 0}ms`} · {e.at}
+              </span>
+            </div>
+            {e.validationError && <div className="mt-1.5 rounded-md border border-nats-warn/40 bg-nats-warn/10 px-3 py-2 text-nats-warn">{e.validationError}</div>}
+            {e.stdout && (
+              <div className="group relative mt-1.5">
+                <pre className="overflow-x-auto whitespace-pre rounded-md border border-border bg-card p-3 text-xs leading-relaxed text-foreground">{e.stdout}</pre>
+                <CopyButton text={e.stdout} className="absolute right-2 top-2 opacity-0 group-hover:opacity-100" />
+              </div>
+            )}
+            {e.stderr && <pre className="mt-1.5 overflow-x-auto whitespace-pre-wrap rounded-md border border-nats-error/30 bg-nats-error/5 p-3 text-xs text-nats-error">{e.stderr}</pre>}
+            {!e.stdout && !e.stderr && !e.validationError && <div className="mt-1 text-xs text-muted-foreground">(no output)</div>}
+          </div>
+        ))}
+        {running && <div className="flex items-center gap-2 text-muted-foreground"><Loader2 size={13} className="animate-spin" /> running…</div>}
+      </div>
+
+      <div className="border-t border-border bg-background px-4 py-3 sm:px-6">
+        <div className="flex items-center gap-2 rounded-md border border-input bg-card px-3 focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/30">
+          <span className="font-mono text-primary">$</span>
+          <input
+            ref={inputRef}
+            value={command}
+            onChange={(e) => setCommand(e.target.value)}
+            onKeyDown={onKeyDown}
+            placeholder="nats stream ls"
+            className="h-10 flex-1 bg-transparent font-mono text-sm outline-none placeholder:text-muted-foreground"
+            disabled={running}
+            autoFocus
+            spellCheck={false}
+            autoComplete="off"
+          />
+          <Button size="sm" onClick={() => run()} disabled={running || !command.trim()}>Run</Button>
         </div>
       </div>
     </div>

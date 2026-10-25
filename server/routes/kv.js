@@ -1,196 +1,52 @@
-import { readJsonBody } from '../utils/http.js'
-import { runKv, runCommand, streamWatch } from '../services/kv-object.js'
+/**
+ * KV bucket routes (see docs/kv-object-api-contract.md).
+ */
 
-function getConn(body, NATS_URL, NATS_TOKEN) {
-  return {
-    server: body?.server || NATS_URL || null,
-    token: body?.token || NATS_TOKEN || null,
-  }
-}
+import * as kvs from '../services/kv-object.js'
+import { readJsonBody, getQuery, sendJson, route } from '../utils/http.js'
 
-function sendResult(res, result, fallbackError) {
-  if (!result.ok) {
-    res.statusCode = 502
-    res.end(JSON.stringify({ ok: false, error: result.stderr || fallbackError, ...result }))
-    return
-  }
-  res.end(JSON.stringify({ ok: true, data: result.parsed, ...result }))
-}
+export function registerKvRoutes(router, { conn }) {
+  const get = (path, handler) => router.get(path, route(async (req, res) => {
+    const query = getQuery(req)
+    const nc = await conn.connectFor(req, query)
+    sendJson(res, 200, { ok: true, data: await handler({ req, query, nc }) })
+  }))
+  const post = (path, handler) => router.post(path, route(async (req, res) => {
+    const body = await readJsonBody(req)
+    const nc = await conn.connectFor(req, body)
+    sendJson(res, 200, { ok: true, data: (await handler({ req, body, nc })) ?? null })
+  }))
 
-export function registerKvRoutes(router, { NATS_URL, NATS_TOKEN }) {
-  router.get('/api/kv/buckets', async (req, res) => {
-    res.setHeader('Content-Type', 'application/json')
-    try {
-      const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
-      const conn = getConn({
-        server: url.searchParams.get('server'),
-        token: url.searchParams.get('token'),
-      }, NATS_URL, NATS_TOKEN)
-      const result = await runKv(['ls', '--json'], conn)
-      sendResult(res, result, 'Failed to list KV buckets')
-    } catch (err) {
-      res.statusCode = 500
-      res.end(JSON.stringify({ ok: false, error: err.message || 'Failed to list KV buckets' }))
-    }
-  })
+  get('/api/kv/buckets', ({ nc }) => kvs.listKvBuckets(nc))
+  get('/api/kv/bucket/:bucket', ({ req, nc }) => kvs.kvBucketInfo(nc, req.params.bucket))
+  post('/api/kv/bucket/create', ({ body, nc }) => kvs.createKvBucket(nc, body))
+  post('/api/kv/bucket/delete', ({ body, nc }) => kvs.deleteKvBucket(nc, body.bucket))
 
-  router.get('/api/kv/bucket/:bucket', async (req, res) => {
-    res.setHeader('Content-Type', 'application/json')
-    try {
-      const { bucket } = req.params || {}
-      const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
-      const conn = getConn({
-        server: url.searchParams.get('server'),
-        token: url.searchParams.get('token'),
-      }, NATS_URL, NATS_TOKEN)
-      const result = await runKv(['info', bucket, '--json'], conn)
-      sendResult(res, result, 'Failed to load bucket info')
-    } catch (err) {
-      res.statusCode = 500
-      res.end(JSON.stringify({ ok: false, error: err.message || 'Failed to load bucket info' }))
-    }
-  })
+  get('/api/kv/keys', ({ query, nc }) => kvs.listKvKeys(nc, query.bucket, query.filter))
+  get('/api/kv/entries', ({ query, nc }) => kvs.listKvEntries(nc, query.bucket, query.filter))
+  post('/api/kv/entry/get', ({ body, nc }) => kvs.getKvEntry(nc, body.bucket, body.key, body.revision))
+  post('/api/kv/entry/put', ({ body, nc }) => kvs.putKvEntry(nc, body.bucket, body.key, body.value, body.encoding))
+  post('/api/kv/entry/delete', ({ body, nc }) => kvs.deleteKvEntry(nc, body.bucket, body.key, false))
+  post('/api/kv/entry/purge', ({ body, nc }) => kvs.deleteKvEntry(nc, body.bucket, body.key, true))
+  post('/api/kv/entry/history', ({ body, nc }) => kvs.kvHistory(nc, body.bucket, body.key))
 
-  const bucketOps = [
-    ['create', '/api/kv/bucket/create'],
-    ['edit', '/api/kv/bucket/update'],
-    ['rm', '/api/kv/bucket/delete'],
-    ['purge', '/api/kv/bucket/purge'],
-  ]
-  for (const [op, path] of bucketOps) {
-    router.post(path, async (req, res) => {
-      res.setHeader('Content-Type', 'application/json')
-      try {
-        const body = await readJsonBody(req)
-        const { bucket, ...config } = body || {}
-        if (!bucket) {
-          res.statusCode = 400
-          res.end(JSON.stringify({ ok: false, error: 'bucket is required' }))
-          return
-        }
-        const conn = getConn(body, NATS_URL, NATS_TOKEN)
-        const args = [op, bucket]
-        if (op === 'create' || op === 'edit') {
-          if (config.description) args.push('--description', String(config.description))
-          if (config.history != null) args.push('--history', String(config.history))
-          if (config.ttl) args.push('--ttl', String(config.ttl))
-          if (config.maxValueSize != null) args.push('--max-value-size', String(config.maxValueSize))
-          if (config.maxBucketSize != null) args.push('--max-bucket-size', String(config.maxBucketSize))
-          if (config.replicas != null) args.push('--replicas', String(config.replicas))
-          if (config.storage) args.push('--storage', String(config.storage))
-          if (config.compression) args.push('--compression', String(config.compression))
-        }
-        args.push('--json')
-        const result = await runKv(args, conn)
-        sendResult(res, result, `Failed to ${op} bucket`)
-      } catch (err) {
-        res.statusCode = 500
-        res.end(JSON.stringify({ ok: false, error: err.message || `Failed to ${op} bucket` }))
-      }
+  // Server-sent events: one `data:` line per KV change
+  router.get('/api/kv/watch', route(async (req, res) => {
+    const query = getQuery(req)
+    const nc = await conn.connectFor(req, query)
+    const stop = await kvs.watchKv(nc, query.bucket, query.key, (entry) => {
+      res.write(`data: ${JSON.stringify(entry)}\n\n`)
     })
-  }
-
-  router.get('/api/kv/keys', async (req, res) => {
-    res.setHeader('Content-Type', 'application/json')
-    try {
-      const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
-      const bucket = url.searchParams.get('bucket')
-      if (!bucket) {
-        res.statusCode = 400
-        res.end(JSON.stringify({ ok: false, error: 'bucket is required' }))
-        return
-      }
-      const conn = getConn({
-        server: url.searchParams.get('server'),
-        token: url.searchParams.get('token'),
-      }, NATS_URL, NATS_TOKEN)
-      const result = await runKv(['keys', bucket, '--json'], conn)
-      sendResult(res, result, 'Failed to list keys')
-    } catch (err) {
-      res.statusCode = 500
-      res.end(JSON.stringify({ ok: false, error: err.message || 'Failed to list keys' }))
-    }
-  })
-
-  const entryOps = [
-    ['get', '/api/kv/entry/get'],
-    ['put', '/api/kv/entry/put'],
-    ['del', '/api/kv/entry/delete'],
-    ['purge', '/api/kv/entry/purge'],
-    ['history', '/api/kv/entry/history'],
-  ]
-  for (const [op, path] of entryOps) {
-    router.post(path, async (req, res) => {
-      res.setHeader('Content-Type', 'application/json')
-      try {
-        const body = await readJsonBody(req)
-        const { bucket, key, value, encoding = 'utf8' } = body || {}
-        if (!bucket || !key) {
-          res.statusCode = 400
-          res.end(JSON.stringify({ ok: false, error: 'bucket and key are required' }))
-          return
-        }
-        const conn = getConn(body, NATS_URL, NATS_TOKEN)
-        const args = [op, bucket, key]
-        if (op === 'put') {
-          if (encoding === 'base64') args.push(Buffer.from(String(value || ''), 'base64').toString('utf8'))
-          else if (encoding === 'json') args.push(JSON.stringify(value ?? null))
-          else args.push(String(value ?? ''))
-        }
-        args.push('--json')
-        const result = await runKv(args, conn)
-        sendResult(res, result, `Failed to ${op} key`)
-      } catch (err) {
-        res.statusCode = 500
-        res.end(JSON.stringify({ ok: false, error: err.message || `Failed to ${op} key` }))
-      }
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
     })
-  }
-
-  router.get('/api/kv/watch', async (req, res) => {
-    try {
-      const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
-      const bucket = url.searchParams.get('bucket')
-      if (!bucket) {
-        res.statusCode = 400
-        res.setHeader('Content-Type', 'application/json')
-        res.end(JSON.stringify({ ok: false, error: 'bucket is required' }))
-        return
-      }
-      const key = url.searchParams.get('key')
-      const updatesOnly = url.searchParams.get('updatesOnly') === 'true'
-      const conn = getConn({
-        server: url.searchParams.get('server'),
-        token: url.searchParams.get('token'),
-      }, NATS_URL, NATS_TOKEN)
-      const args = ['watch', bucket]
-      if (key) args.push(key)
-      if (updatesOnly) args.push('--updates-only')
-      args.push('--json')
-      streamWatch({ kind: 'kv', args, conn, req, res })
-    } catch (err) {
-      res.statusCode = 500
-      res.setHeader('Content-Type', 'application/json')
-      res.end(JSON.stringify({ ok: false, error: err.message || 'Watch failed' }))
-    }
-  })
-
-  router.post('/api/kv/command', async (req, res) => {
-    res.setHeader('Content-Type', 'application/json')
-    try {
-      const body = await readJsonBody(req)
-      const { args } = body || {}
-      if (!Array.isArray(args) || !args.length) {
-        res.statusCode = 400
-        res.end(JSON.stringify({ ok: false, error: 'args must be a non-empty array' }))
-        return
-      }
-      const conn = getConn(body, NATS_URL, NATS_TOKEN)
-      const result = await runCommand(args, conn)
-      sendResult(res, result, 'Command failed')
-    } catch (err) {
-      res.statusCode = 500
-      res.end(JSON.stringify({ ok: false, error: err.message || 'Command failed' }))
-    }
-  })
+    res.write(': connected\n\n')
+    const ping = setInterval(() => res.write(': ping\n\n'), 15000)
+    req.on('close', () => {
+      clearInterval(ping)
+      stop()
+    })
+  }, 'Watch failed'))
 }

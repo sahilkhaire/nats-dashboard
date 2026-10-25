@@ -1,16 +1,27 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useNavigate, Link, useLocation, useSearchParams } from 'react-router-dom'
-import { useNatsPolling }    from '../../../hooks/useNatsPolling'
+import {
+  ChevronLeft, ChevronsDown, CircleMinus, Code2, Copy, CopyPlus, Database, Eraser, Lock, MoreHorizontal, PencilLine, Terminal, Trash2,
+} from 'lucide-react'
+import { useJetStreamData } from '../../../hooks/useJetStreamData'
 import { useStreamTimeseries } from '../../../hooks/useStreamTimeseries'
-import { normalizeRetention } from '../../../utils/retention'
+import { useConfig } from '../../../context/ConfigContext'
 import { useStreamMutation } from '../../../hooks/useStreamMutation'
-import { AlertBanner }       from '../../../components/AlertBanner'
-import { RefreshSelector }   from '../../../components/RefreshSelector'
-import { Trash2, ChevronLeft, Ellipsis, PencilLine, CopyPlus, Copy, ChevronsDown, CircleMinus, Terminal, Code2, Eraser, Lock } from 'lucide-react'
+import { normalizeRetention } from '../../../utils/retention'
+import { formatBytes, formatCompact, formatNumber, formatRate } from '../../../utils/byteFormatter'
+import { timeAgo } from '../../../utils/duration'
 import { useConfirmDialog } from '../../../components/shared/ConfirmDialogProvider'
-import { UpdateStreamModal } from '../../../components/UpdateStreamModal'
-import { Button, Input, Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '../../../components/ui'
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuShortcut, DropdownMenuTrigger } from '../../../components/ui/dropdown-menu'
+import { UpdateStreamModal } from '../../../components/modals/UpdateStreamModal'
+import { Button } from '../../../components/ui/button'
+import { Input } from '../../../components/ui/input'
+import { StatusBadge } from '../../../components/ui/StatusBadge'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '../../../components/ui/dialog'
+import {
+  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuShortcut, DropdownMenuTrigger,
+} from '../../../components/ui/dropdown-menu'
+import { PollState } from '../../../components/shared/PageState'
+import { EmptyState } from '../../../components/shared/EmptyState'
+import { CopyButton } from '../../../components/shared/CopyButton'
 import { useNotifications } from '../../../context/NotificationContext'
 
 import { AnalyticsTab }  from './tabs/AnalyticsTab'
@@ -22,412 +33,340 @@ import { PublishTab }    from './tabs/PublishTab'
 import { ScheduleTab }   from './tabs/ScheduleTab'
 import { StreamSwitcherSidebar } from './components/StreamSwitcherSidebar'
 
-const TAB_IDS = ['analytics', 'properties', 'consumers', 'messages', 'relations', 'publish', 'schedule']
+const TAB_IDS = ['analytics', 'messages', 'consumers', 'publish', 'properties', 'relations', 'schedule']
+const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform)
+const MOD = isMac ? '⌘' : 'Ctrl'
+
+function Stat({ label, value, title }) {
+  return (
+    <div className="min-w-0 px-4 py-3" title={title}>
+      <div className="truncate text-[11px] uppercase tracking-wider text-muted-foreground">{label}</div>
+      <div className="mt-0.5 truncate font-mono text-base font-semibold tabular">{value}</div>
+    </div>
+  )
+}
+
+function NameDialog({ open, title, description, label, initial, extra, submitLabel, onSubmit, onClose }) {
+  const [name, setName] = useState(initial)
+  const [extraValue, setExtraValue] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    if (open) { setName(initial); setExtraValue(''); setError('') }
+  }, [open, initial])
+
+  const submit = async (e) => {
+    e.preventDefault()
+    if (!name.trim()) return
+    setBusy(true)
+    setError('')
+    try {
+      await onSubmit(name.trim(), extraValue.trim())
+      onClose()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => !o && !busy && onClose()}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+          {description && <DialogDescription>{description}</DialogDescription>}
+        </DialogHeader>
+        <form onSubmit={submit} className="space-y-4">
+          {error && <div className="rounded-md border border-nats-error/40 bg-nats-error/10 px-3 py-2 text-sm text-nats-error">{error}</div>}
+          <div>
+            <label className="field-label">{label}</label>
+            <Input value={name} onChange={(e) => setName(e.target.value)} className="font-mono" autoFocus />
+          </div>
+          {extra && (
+            <div>
+              <label className="field-label">{extra.label}</label>
+              <Input value={extraValue} onChange={(e) => setExtraValue(e.target.value)} placeholder={extra.placeholder} className="font-mono" />
+              {extra.hint && <p className="field-hint">{extra.hint}</p>}
+            </div>
+          )}
+          <DialogFooter className="gap-2">
+            <Button type="button" variant="outline" onClick={onClose} disabled={busy}>Cancel</Button>
+            <Button type="submit" disabled={busy || !name.trim()}>{busy ? 'Working…' : submitLabel}</Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}
 
 export function StreamDetailPage() {
-  const { name }     = useParams()
-  const navigate     = useNavigate()
+  const { name } = useParams()
+  const navigate = useNavigate()
   const location = useLocation()
   const [searchParams, setSearchParams] = useSearchParams()
-  const [refreshInterval,  setRefreshInterval]  = useState(2000)
-  const [menuBusy,         setMenuBusy]         = useState(false)
-  const [showUpdateModal,  setShowUpdateModal]  = useState(false)
-  const [showDuplicateModal, setShowDuplicateModal] = useState(false)
-  const [duplicateName, setDuplicateName] = useState('')
-  const [showMirrorModal, setShowMirrorModal] = useState(false)
-  const [mirrorName, setMirrorName] = useState('')
-  const [mirrorFilterSubject, setMirrorFilterSubject] = useState('')
-  const [configPreview, setConfigPreview] = useState({ open: false, title: '', content: '' })
+  const [busy, setBusy] = useState(false)
+  const [dialog, setDialog] = useState(null) // 'edit' | 'duplicate' | 'mirror'
+  const [preview, setPreview] = useState(null) // { title, content }
   const { confirm } = useConfirmDialog()
+  const { connection } = useConfig()
   const { notifyError, notifySuccess } = useNotifications()
+  const api = useStreamMutation()
 
-  const { data, error, lastFetch, refetch } = useNatsPolling('/jsz?accounts=true&streams=true&consumers=true&config=true', refreshInterval)
-  const {
-    deleteStream,
-    updateStream,
-    purgeStream,
-    duplicateStream,
-    createMirrorStream,
-    stepDownLeader,
-    removeFollowers,
-    sealStream,
-    getStreamCliConfig,
-    getStreamTerraformConfig,
-  } = useStreamMutation()
-  const accountDetails = data?.account_details ?? []
-  const allStreams = accountDetails.flatMap((acc) =>
-    (acc.stream_detail ?? []).map((streamDetail) => ({ ...streamDetail, account: acc.name }))
-  )
-  const timeseriesByName = useStreamTimeseries(allStreams, { maxPoints: 90 })
-  const activeTab = useMemo(() => {
-    const tab = searchParams.get('tab')
-    if (tab && TAB_IDS.includes(tab)) return tab
-    return 'properties'
-  }, [searchParams])
+  const { data, error, lastFetch, refetch, streams } = useJetStreamData()
+  const series = useStreamTimeseries(streams, lastFetch, { cacheKey: `jsz:${connection?.id}` })
 
-  let stream = null
-  for (const acc of accountDetails) {
-    for (const sd of acc.stream_detail ?? []) {
-      if (sd.name === name) { stream = sd; break }
-    }
-    if (stream) break
-  }
-
+  const tab = TAB_IDS.includes(searchParams.get('tab')) ? searchParams.get('tab') : 'analytics'
+  const stream = useMemo(() => streams.find((s) => s.name === name) || null, [streams, name])
   const streamName = stream?.name || name
   const consumers = stream?.consumer_detail ?? []
-  const streamSeries = timeseriesByName.get(streamName) ?? []
+  const points = series.get(streamName) ?? []
+  const latest = points.length > 1 ? points[points.length - 1] : null
+  const cfg = stream?.config || {}
   const followerCount = (stream?.cluster?.replicas || []).filter((r) => !r.current).length
-  const canStepDown = Boolean(stream?.cluster?.leader)
-  const canRemoveFollowers = followerCount > 0
 
-  const setActiveTab = (tabId) => {
-    const nextParams = new URLSearchParams(searchParams)
-    nextParams.set('tab', tabId)
-    setSearchParams(nextParams, { replace: true })
+  const setTab = (id) => {
+    const next = new URLSearchParams(searchParams)
+    next.set('tab', id)
+    setSearchParams(next, { replace: true })
   }
 
-  const handleDelete = async () => {
-    const shouldDelete = await confirm(
-      `Delete stream "${streamName}"?`,
-      'This action permanently removes the stream and all associated data.'
-    )
-    if (!shouldDelete) return
+  const run = async (fn, ok) => {
+    setBusy(true)
     try {
-      await deleteStream(streamName)
-      notifySuccess('Stream deleted', `"${streamName}" was deleted.`, 'stream')
-      navigate('/streams')
-    } catch (err) {
-      notifyError('Delete failed', err.message || 'Unable to delete stream.', 'stream')
-    }
-  }
-
-  const handleUpdate = async (streamName, config) => {
-    try {
-      await updateStream(streamName, config)
+      const res = await fn()
+      if (ok) notifySuccess('Done', typeof ok === 'function' ? ok(res) : ok, 'stream')
       refetch()
-      notifySuccess('Stream updated', `"${streamName}" was updated.`, 'stream')
+      return res
     } catch (err) {
-      notifyError('Update failed', err.message || 'Unable to update stream.', 'stream')
-      throw err
-    }
-  }
-
-  const runAction = async (fn, okMessage, shouldRefetch = true) => {
-    setMenuBusy(true)
-    try {
-      await fn()
-      if (okMessage) notifySuccess('Action completed', okMessage, 'stream')
-      if (shouldRefetch) refetch()
-    } catch (err) {
-      notifyError('Action failed', err.message || 'Action failed', 'stream')
+      notifyError('Action failed', err.message, 'stream')
+      return null
     } finally {
-      setMenuBusy(false)
+      setBusy(false)
     }
   }
 
-  const handlePurgeFromMenu = async () => {
-    const shouldPurge = await confirm(
-      `Purge messages in "${streamName}"?`,
-      'This removes all messages from the stream.'
-    )
-    if (!shouldPurge) return
-    await runAction(() => purgeStream(streamName), 'Messages purged.')
+  const actions = {
+    edit: () => setDialog('edit'),
+    duplicate: () => setDialog('duplicate'),
+    mirror: () => setDialog('mirror'),
+    stepDown: async () => {
+      if (!(await confirm('Step down the stream leader?', 'A new leader is elected among the replicas. Clients may see a brief pause.', { confirmLabel: 'Step down', destructive: false }))) return
+      run(() => api.stepDownLeader(streamName), 'Leader step-down requested.')
+    },
+    removeFollowers: async () => {
+      if (!(await confirm('Remove lagging followers?', 'Replicas that are not current are removed; JetStream re-places them on other servers.', { confirmLabel: 'Remove' }))) return
+      run(() => api.removeFollowers(streamName), (r) => (r?.removed?.length ? `Removed ${r.removed.join(', ')}` : r?.skipped || 'Nothing to remove.'))
+    },
+    cli: () => run(async () => {
+      const r = await api.getStreamCliConfig(streamName)
+      setPreview({ title: 'NATS CLI command', content: r.cli })
+    }),
+    terraform: () => run(async () => {
+      const r = await api.getStreamTerraformConfig(streamName)
+      setPreview({ title: 'Terraform', content: r.terraform })
+    }),
+    purge: async () => {
+      if (!(await confirm(`Purge all messages in "${streamName}"?`, `${formatNumber(stream?.state?.messages ?? 0)} messages will be removed. Configuration and consumers are kept.`, { confirmLabel: 'Purge' }))) return
+      run(() => api.purgeStream(streamName), (r) => `${formatNumber(r?.purged ?? 0)} messages purged.`)
+    },
+    seal: async () => {
+      if (!(await confirm(`Seal "${streamName}"?`, 'A sealed stream rejects new messages, deletes and purges. This cannot be undone.', { confirmLabel: 'Seal stream', requireText: streamName }))) return
+      run(() => api.sealStream(streamName), 'Stream sealed.')
+    },
+    delete: async () => {
+      if (!(await confirm(`Delete stream "${streamName}"?`, 'The stream, its messages and all consumers are permanently removed.', { confirmLabel: 'Delete stream', requireText: streamName }))) return
+      const res = await run(() => api.deleteStream(streamName), `"${streamName}" deleted.`)
+      if (res) navigate('/streams')
+    },
   }
 
-  const handleSeal = async () => {
-    const shouldSeal = await confirm(
-      `Seal stream "${streamName}"?`,
-      'Sealed streams become immutable and cannot be unsealed.'
-    )
-    if (!shouldSeal) return
-    await runAction(() => sealStream(streamName), 'Stream sealed.')
-  }
-
-  const handleStepDown = async () => {
-    await runAction(() => stepDownLeader(streamName), 'Leader step-down requested.')
-  }
-
-  const handleRemoveFollowers = async () => {
-    const shouldRemove = await confirm(
-      `Remove follower(s) for "${streamName}"?`,
-      'This removes non-leader replicas for this stream.'
-    )
-    if (!shouldRemove) return
-    await runAction(() => removeFollowers(streamName), 'Follower removal requested.')
-  }
-
-  const handleShowCli = async () => {
-    await runAction(async () => {
-      const data = await getStreamCliConfig(streamName)
-      setConfigPreview({ open: true, title: 'NATS CLI Config', content: data.cli || '' })
-    }, '', false)
-  }
-
-  const handleShowTerraform = async () => {
-    await runAction(async () => {
-      const data = await getStreamTerraformConfig(streamName)
-      setConfigPreview({ open: true, title: 'Terraform Config', content: data.terraform || '' })
-    }, '', false)
-  }
-
-  const handleDuplicate = async () => {
-    const target = duplicateName.trim()
-    if (!target) {
-      notifyError('Validation error', 'Duplicate stream name is required.', 'stream')
-      return
-    }
-    await runAction(() => duplicateStream(streamName, target), `Stream duplicated as "${target}".`)
-    setShowDuplicateModal(false)
-    setDuplicateName('')
-  }
-
-  const handleCreateMirror = async () => {
-    const target = mirrorName.trim()
-    if (!target) {
-      notifyError('Validation error', 'Mirror stream name is required.', 'stream')
-      return
-    }
-    const mirror = {}
-    if (mirrorFilterSubject.trim()) mirror.filter_subject = mirrorFilterSubject.trim()
-    await runAction(() => createMirrorStream(streamName, target, mirror), `Mirror stream "${target}" created.`)
-    setShowMirrorModal(false)
-    setMirrorName('')
-    setMirrorFilterSubject('')
-  }
-
+  // Keyboard shortcuts (ignored while typing)
+  const actionsRef = useRef(actions)
+  actionsRef.current = actions
   useEffect(() => {
-    if (!data || !stream) return undefined
+    if (!stream) return undefined
     const onKeyDown = (e) => {
-      const activeTag = document.activeElement?.tagName
-      if (activeTag === 'INPUT' || activeTag === 'TEXTAREA') return
-      if (e.metaKey && !e.shiftKey && e.key.toLowerCase() === 'e') {
-        e.preventDefault()
-        setShowUpdateModal(true)
-      } else if (e.metaKey && !e.shiftKey && e.key.toLowerCase() === 'd') {
-        e.preventDefault()
-        setDuplicateName(`${streamName}-copy`)
-        setShowDuplicateModal(true)
-      } else if (e.metaKey && e.shiftKey && e.key.toLowerCase() === 'm') {
-        e.preventDefault()
-        setMirrorName(`${streamName}-mirror`)
-        setShowMirrorModal(true)
-      } else if (!e.metaKey && e.shiftKey && e.key.toLowerCase() === 'l') {
-        e.preventDefault()
-        void handleStepDown()
-      } else if (!e.metaKey && e.shiftKey && e.key.toLowerCase() === 'f') {
-        e.preventDefault()
-        void handleShowCli()
-      } else if (!e.metaKey && e.shiftKey && e.key.toLowerCase() === 'p') {
-        e.preventDefault()
-        void handlePurgeFromMenu()
-      } else if (!e.metaKey && e.shiftKey && e.key.toLowerCase() === 's') {
-        e.preventDefault()
-        void handleSeal()
-      } else if (e.metaKey && e.shiftKey && e.key.toLowerCase() === 'd') {
-        e.preventDefault()
-        void handleDelete()
-      }
+      const el = document.activeElement
+      if (el && (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) || el.isContentEditable)) return
+      if (document.querySelector('[role="dialog"], [role="alertdialog"]')) return
+      const mod = e.metaKey || e.ctrlKey
+      const key = e.key.toLowerCase()
+      const a = actionsRef.current
+      if (mod && !e.shiftKey && key === 'e') { e.preventDefault(); a.edit() }
+      else if (mod && e.shiftKey && key === 'd') { e.preventDefault(); a.duplicate() }
+      else if (mod && e.shiftKey && key === 'm') { e.preventDefault(); a.mirror() }
+      else if (!mod && !e.altKey && /^[1-7]$/.test(e.key)) { setTab(TAB_IDS[Number(e.key) - 1]) }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [data, stream, streamName])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [Boolean(stream), searchParams])
 
-  if (error)  return <div className="p-6"><AlertBanner variant="error" title="Error">{error}</AlertBanner></div>
-  if (!data)  return <div className="p-6 text-muted-foreground">Loading...</div>
-  if (!stream) return <div className="p-6 text-muted-foreground">Stream not found.</div>
+  useEffect(() => {
+    document.title = `${name} · Streams · NATS Dashboard`
+  }, [name])
 
   const tabs = [
-    { id: 'analytics', label: 'Analytics' },
-    { id: 'properties', label: 'Properties' },
-    { id: 'consumers',  label: `Consumers${consumers.length > 0 ? ` (${consumers.length})` : ''}` },
-    { id: 'messages',   label: 'Messages' },
-    { id: 'relations',  label: 'Relations' },
-    { id: 'publish',    label: 'Publish' },
-    { id: 'schedule',   label: 'Schedule' },
+    { id: 'analytics', label: 'Overview' },
+    { id: 'messages', label: 'Messages' },
+    { id: 'consumers', label: 'Consumers', count: consumers.length },
+    { id: 'publish', label: 'Publish' },
+    { id: 'properties', label: 'Configuration' },
+    { id: 'relations', label: 'Relations' },
+    { id: 'schedule', label: 'Purge & schedules' },
   ]
 
   return (
-    <div className="-m-6 flex min-h-[calc(100vh-4rem)] flex-col lg:flex-row">
-      <StreamSwitcherSidebar
-        streams={allStreams}
-        currentStreamName={streamName}
-        currentSearch={location.search}
-      />
-      <div className="min-w-0 flex-1 space-y-5 p-6">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <Link to="/streams" className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
-              <ChevronLeft size={18} />
-            </Link>
-            <div>
-              <h1 className="font-mono text-xl font-semibold text-nats-accent">{stream.name}</h1>
-              <p className="mt-0.5 text-xs text-muted-foreground">
-                {stream.config?.storage ?? 'file'} · {normalizeRetention(stream.config?.retention)} · {(stream.state?.messages ?? 0).toLocaleString()} msgs
-              </p>
+    <div className="flex min-h-[calc(100vh-3.5rem)] flex-col lg:flex-row">
+      <StreamSwitcherSidebar streams={streams} currentStreamName={streamName} currentSearch={location.search} />
+      <div className="min-w-0 flex-1 p-4 sm:p-6">
+        <PollState data={data} error={error} onRetry={refetch}>
+          {!stream ? (
+            <div className="surface-card">
+              <EmptyState icon={Database} title={`Stream "${name}" not found`} description="It may have been deleted, or it lives on another connection."
+                action={<Link to="/streams" className="link text-sm">Back to streams</Link>} />
             </div>
-          </div>
-          <div className="flex items-center gap-3">
-            <RefreshSelector interval={refreshInterval} onChange={setRefreshInterval} lastFetch={lastFetch} />
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button variant="outline" size="icon" title="Manage stream">
-                  <Ellipsis size={16} />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-72">
-                <DropdownMenuLabel>Manage Stream</DropdownMenuLabel>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onSelect={() => setShowUpdateModal(true)} disabled={menuBusy}>
-                  <PencilLine size={14} /> Edit Stream
-                  <DropdownMenuShortcut>⌘ + E</DropdownMenuShortcut>
-                </DropdownMenuItem>
-                <DropdownMenuItem onSelect={() => { setDuplicateName(`${stream.name}-copy`); setShowDuplicateModal(true) }} disabled={menuBusy}>
-                  <CopyPlus size={14} /> Duplicate Stream
-                  <DropdownMenuShortcut>⌘ + D</DropdownMenuShortcut>
-                </DropdownMenuItem>
-                <DropdownMenuItem onSelect={() => { setMirrorName(`${stream.name}-mirror`); setShowMirrorModal(true) }} disabled={menuBusy}>
-                  <Copy size={14} /> Create Mirror
-                  <DropdownMenuShortcut>⌘ + ⇧ + M</DropdownMenuShortcut>
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onSelect={handleStepDown} disabled={menuBusy || !canStepDown}>
-                  <ChevronsDown size={14} /> Step Down Leader
-                  <DropdownMenuShortcut>Shift + L</DropdownMenuShortcut>
-                </DropdownMenuItem>
-                <DropdownMenuItem onSelect={handleRemoveFollowers} disabled={menuBusy || !canRemoveFollowers}>
-                  <CircleMinus size={14} /> Remove Follower(s)
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onSelect={handleShowCli} disabled={menuBusy}>
-                  <Terminal size={14} /> Show NATS CLI Config
-                  <DropdownMenuShortcut>Shift + F</DropdownMenuShortcut>
-                </DropdownMenuItem>
-                <DropdownMenuItem onSelect={handleShowTerraform} disabled={menuBusy}>
-                  <Code2 size={14} /> Show Terraform Config
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onSelect={handlePurgeFromMenu} disabled={menuBusy}>
-                  <Eraser size={14} /> Purge Messages
-                  <DropdownMenuShortcut>Shift + P</DropdownMenuShortcut>
-                </DropdownMenuItem>
-                <DropdownMenuItem onSelect={handleSeal} disabled={menuBusy}>
-                  <Lock size={14} /> Seal Stream
-                  <DropdownMenuShortcut>Shift + S</DropdownMenuShortcut>
-                </DropdownMenuItem>
-                <DropdownMenuItem onSelect={handleDelete} disabled={menuBusy} className="text-destructive focus:text-destructive">
-                  <Trash2 size={14} /> Delete Stream
-                  <DropdownMenuShortcut>⌘ + Shift + D</DropdownMenuShortcut>
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-            <Button
-              onClick={handleDelete}
-              variant="outline"
-              className="border-nats-error/40 text-nats-error hover:bg-nats-error/20"
-            >
-              <Trash2 size={14} /> Delete
-            </Button>
-          </div>
-        </div>
-
-        <div className="premium-tabs">
-          {tabs.map(tab => (
-            <button
-              key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
-              className={`premium-tab-btn ${
-                activeTab === tab.id
-                  ? 'premium-tab-btn-active'
-                  : ''
-              }`}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
-
-        {activeTab === 'analytics'  && <AnalyticsTab points={streamSeries} refreshInterval={refreshInterval} />}
-        {activeTab === 'properties' && <PropertiesTab stream={stream} onUpdate={handleUpdate} />}
-        {activeTab === 'consumers'  && (
-          <ConsumersTab
-            consumers={consumers}
-            lastFetch={lastFetch}
-            streamName={streamName}
-            refreshInterval={refreshInterval}
-          />
-        )}
-        {activeTab === 'messages'   && <MessagesTab   stream={stream} />}
-        {activeTab === 'relations'  && <RelationsTab  stream={stream} allStreams={allStreams} />}
-        {activeTab === 'publish'    && <PublishTab    stream={stream} />}
-        {activeTab === 'schedule'   && <ScheduleTab   streamName={stream.name} purgeStream={purgeStream} />}
-
-        <UpdateStreamModal
-          open={showUpdateModal}
-          stream={stream.name}
-          config={stream.config}
-          onClose={() => setShowUpdateModal(false)}
-          onSave={handleUpdate}
-        />
-
-        <Dialog open={showDuplicateModal} onOpenChange={setShowDuplicateModal}>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Duplicate Stream</DialogTitle>
-            </DialogHeader>
-            <div className="space-y-2">
-              <label className="text-sm text-muted-foreground">New stream name</label>
-              <Input value={duplicateName} onChange={(e) => setDuplicateName(e.target.value)} placeholder="orders-copy" />
-            </div>
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setShowDuplicateModal(false)}>Cancel</Button>
-              <Button onClick={handleDuplicate} disabled={menuBusy}>Create Duplicate</Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-
-        <Dialog open={showMirrorModal} onOpenChange={setShowMirrorModal}>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Create Mirror</DialogTitle>
-            </DialogHeader>
-            <div className="space-y-3">
-              <div className="space-y-1">
-                <label className="text-sm text-muted-foreground">Mirror stream name</label>
-                <Input value={mirrorName} onChange={(e) => setMirrorName(e.target.value)} placeholder="orders-mirror" />
+          ) : (
+            <div className="space-y-5">
+              {/* Header */}
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div className="flex min-w-0 items-start gap-2">
+                  <Link to="/streams" className="mt-0.5 rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground" aria-label="Back to streams">
+                    <ChevronLeft size={18} />
+                  </Link>
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h1 className="truncate font-mono text-lg font-semibold">{stream.name}</h1>
+                      <CopyButton text={stream.name} />
+                      {cfg.sealed && <StatusBadge status="warn">sealed</StatusBadge>}
+                      {cfg.mirror && <StatusBadge status="info">mirror of {cfg.mirror.name}</StatusBadge>}
+                      {stream.kind !== 'stream' && <StatusBadge status="accent">{stream.kind === 'kv' ? 'KV bucket' : 'object store'}</StatusBadge>}
+                    </div>
+                    <p className="mt-0.5 text-xs text-muted-foreground">
+                      {cfg.description ? `${cfg.description} · ` : ''}{cfg.storage ?? 'file'} · {normalizeRetention(cfg.retention)} retention · R{cfg.num_replicas ?? 1}
+                      {stream.cluster?.leader ? ` · leader ${stream.cluster.leader}` : ''}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  <Button variant="outline" size="sm" onClick={actions.edit} disabled={busy || cfg.sealed}><PencilLine size={14} /> Edit</Button>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button variant="outline" size="sm" disabled={busy} aria-label="More actions"><MoreHorizontal size={15} /></Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="w-64">
+                      <DropdownMenuLabel>Stream actions</DropdownMenuLabel>
+                      <DropdownMenuItem onSelect={actions.edit} disabled={cfg.sealed}><PencilLine size={14} /> Edit configuration<DropdownMenuShortcut>{MOD}E</DropdownMenuShortcut></DropdownMenuItem>
+                      <DropdownMenuItem onSelect={actions.duplicate}><CopyPlus size={14} /> Duplicate…<DropdownMenuShortcut>{MOD}⇧D</DropdownMenuShortcut></DropdownMenuItem>
+                      <DropdownMenuItem onSelect={actions.mirror}><Copy size={14} /> Create mirror…<DropdownMenuShortcut>{MOD}⇧M</DropdownMenuShortcut></DropdownMenuItem>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem onSelect={actions.cli}><Terminal size={14} /> Show CLI command</DropdownMenuItem>
+                      <DropdownMenuItem onSelect={actions.terraform}><Code2 size={14} /> Show Terraform</DropdownMenuItem>
+                      {stream.cluster?.leader && (
+                        <>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem onSelect={actions.stepDown}><ChevronsDown size={14} /> Step down leader</DropdownMenuItem>
+                          <DropdownMenuItem onSelect={actions.removeFollowers} disabled={followerCount === 0}><CircleMinus size={14} /> Remove lagging followers</DropdownMenuItem>
+                        </>
+                      )}
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem onSelect={actions.purge} disabled={cfg.sealed || cfg.deny_purge}><Eraser size={14} /> Purge messages</DropdownMenuItem>
+                      <DropdownMenuItem onSelect={actions.seal} disabled={cfg.sealed}><Lock size={14} /> Seal stream</DropdownMenuItem>
+                      <DropdownMenuItem onSelect={actions.delete} className="text-nats-error focus:text-nats-error"><Trash2 size={14} /> Delete stream</DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
               </div>
-              <div className="space-y-1">
-                <label className="text-sm text-muted-foreground">Filter subject (optional)</label>
-                <Input value={mirrorFilterSubject} onChange={(e) => setMirrorFilterSubject(e.target.value)} placeholder="orders.created" />
+
+              {/* Stat strip */}
+              <div className="surface-card grid grid-cols-2 divide-border sm:grid-cols-3 lg:grid-cols-6 lg:divide-x">
+                <Stat label="Messages" value={formatCompact(stream.state?.messages ?? 0)} title={formatNumber(stream.state?.messages)} />
+                <Stat label="Size" value={formatBytes(stream.state?.bytes ?? 0)} />
+                <Stat label="Ingest" value={latest ? formatRate(latest.msgsPerSec) : '—'} />
+                <Stat label="Consumers" value={formatNumber(stream.state?.consumer_count ?? consumers.length)} />
+                <Stat label="Sequence" value={`${formatCompact(stream.state?.first_seq ?? 0)} → ${formatCompact(stream.state?.last_seq ?? 0)}`} title={`${formatNumber(stream.state?.first_seq)} → ${formatNumber(stream.state?.last_seq)}`} />
+                <Stat label="Last message" value={stream.state?.last_seq ? timeAgo(stream.state?.last_ts) : 'never'} title={stream.state?.last_ts} />
+              </div>
+
+              {/* Tabs */}
+              <div className="premium-tabs" role="tablist">
+                {tabs.map((t) => (
+                  <button key={t.id} type="button" role="tab" aria-selected={tab === t.id} onClick={() => setTab(t.id)}
+                    className={`premium-tab-btn ${tab === t.id ? 'premium-tab-btn-active' : ''}`}>
+                    {t.label}
+                    {t.count > 0 && <span className="rounded-full bg-muted px-1.5 font-mono text-[10px] text-muted-foreground">{t.count}</span>}
+                  </button>
+                ))}
+              </div>
+
+              {/* key = stream name so per-tab state never leaks between streams */}
+              <div key={stream.name}>
+                {tab === 'analytics'  && <AnalyticsTab points={points} stream={stream} />}
+                {tab === 'properties' && <PropertiesTab stream={stream} onUpdate={(n, c) => api.updateStream(n, c).then((r) => { refetch(); return r })} />}
+                {tab === 'consumers'  && <ConsumersTab consumers={consumers} lastFetch={lastFetch} stream={stream} onChanged={refetch} />}
+                {tab === 'messages'   && <MessagesTab stream={stream} />}
+                {tab === 'relations'  && <RelationsTab stream={stream} allStreams={streams} />}
+                {tab === 'publish'    && <PublishTab stream={stream} />}
+                {tab === 'schedule'   && <ScheduleTab stream={stream} onPurged={refetch} />}
               </div>
             </div>
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setShowMirrorModal(false)}>Cancel</Button>
-              <Button onClick={handleCreateMirror} disabled={menuBusy}>Create Mirror</Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-
-        <Dialog open={configPreview.open} onOpenChange={(open) => setConfigPreview((prev) => ({ ...prev, open }))}>
-          <DialogContent className="max-w-2xl">
-            <DialogHeader>
-              <DialogTitle>{configPreview.title}</DialogTitle>
-            </DialogHeader>
-            <pre className="max-h-[50vh] overflow-auto rounded-md border border-border bg-muted p-3 text-xs">{configPreview.content}</pre>
-            <DialogFooter>
-              <Button
-                variant="outline"
-                onClick={async () => {
-                  await navigator.clipboard.writeText(configPreview.content || '')
-                  notifySuccess('Copied', 'Configuration copied to clipboard.', 'stream')
-                }}
-              >
-                Copy
-              </Button>
-              <Button onClick={() => setConfigPreview({ open: false, title: '', content: '' })}>Close</Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+          )}
+        </PollState>
       </div>
+
+      <UpdateStreamModal
+        open={dialog === 'edit'}
+        stream={streamName}
+        config={cfg}
+        onClose={() => setDialog(null)}
+        onSave={async (n, c) => {
+          await api.updateStream(n, c)
+          notifySuccess('Stream updated', `"${n}" was updated.`, 'stream')
+          refetch()
+        }}
+      />
+      <NameDialog
+        open={dialog === 'duplicate'}
+        title="Duplicate stream"
+        description="Creates a new stream with the same configuration. Without subjects, the copy sources all messages from this stream."
+        label="New stream name"
+        initial={`${streamName}_copy`}
+        extra={{ label: 'Subjects (optional)', placeholder: 'e.g. orders-copy.>', hint: 'Must not overlap with this stream\'s subjects' }}
+        submitLabel="Duplicate"
+        onClose={() => setDialog(null)}
+        onSubmit={async (target, subjects) => {
+          const config = subjects ? { subjects: subjects.split(',').map((s) => s.trim()).filter(Boolean) } : undefined
+          await api.duplicateStream(streamName, target, config)
+          notifySuccess('Stream duplicated', `"${target}" created.`, 'stream')
+          refetch()
+        }}
+      />
+      <NameDialog
+        open={dialog === 'mirror'}
+        title="Create mirror"
+        description="A mirror is a read-only replica that copies every message from this stream."
+        label="Mirror stream name"
+        initial={`${streamName}_mirror`}
+        extra={{ label: 'Filter subject (optional)', placeholder: 'e.g. orders.created' }}
+        submitLabel="Create mirror"
+        onClose={() => setDialog(null)}
+        onSubmit={async (target, filter) => {
+          await api.createMirrorStream(streamName, target, filter ? { filter_subject: filter } : {})
+          notifySuccess('Mirror created', `"${target}" mirrors "${streamName}".`, 'stream')
+          refetch()
+        }}
+      />
+      <Dialog open={Boolean(preview)} onOpenChange={(o) => !o && setPreview(null)}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader><DialogTitle>{preview?.title}</DialogTitle></DialogHeader>
+          <pre className="max-h-[55vh] overflow-auto whitespace-pre-wrap break-all rounded-md border border-border bg-muted/50 p-3 font-mono text-xs">{preview?.content}</pre>
+          <DialogFooter className="gap-2">
+            <CopyButton text={preview?.content} label="Copy" className="rounded-md border border-border px-3 py-1.5" />
+            <Button onClick={() => setPreview(null)}>Close</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

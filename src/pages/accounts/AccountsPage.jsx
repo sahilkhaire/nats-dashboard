@@ -1,70 +1,73 @@
+import { useMemo } from 'react'
+import { Users } from 'lucide-react'
 import { useNatsPolling } from '../../hooks/useNatsPolling'
 import { useTableSort } from '../../hooks/useTableSort'
-import { AlertBanner } from '../../components/AlertBanner'
-import { NatsProtocolNotice } from '../../components/NatsProtocolNotice'
-import { SortableTh } from '../../components/ui'
+import { SortableTh } from '../../components/ui/SortableTh'
+import { MetricCard } from '../../components/ui/MetricCard'
+import { PageHeader } from '../../components/shared/PageHeader'
+import { PollState } from '../../components/shared/PageState'
+import { EmptyState } from '../../components/shared/EmptyState'
+import { formatBytes, formatCompact, formatNumber } from '../../utils/byteFormatter'
 
-export function AccountsPage() {
-  // /accstatz provides per-account connection, subscription, and traffic stats.
-  // Falls back to /accountz (which only returns account names) if accstatz is unavailable.
-  const { data, error } = useNatsPolling('/accstatz', 10000)
+function Accounts({ data }) {
+  const accounts = useMemo(() => (data.account_statz ?? []).map((a) => ({
+    name: a.acc ?? a.name ?? '',
+    conns: a.conns ?? 0,
+    leafnodes: a.leafnodes ?? 0,
+    subs: a.num_subscriptions ?? 0,
+    sentMsgs: a.sent?.msgs ?? 0,
+    sentBytes: a.sent?.bytes ?? 0,
+    recvMsgs: a.received?.msgs ?? 0,
+    recvBytes: a.received?.bytes ?? 0,
+    slow: a.slow_consumers ?? 0,
+  })), [data])
+  const { sortedData, sortBy, sortDir, handleSort } = useTableSort(accounts, { defaultSortBy: 'name' })
+  const th = (k, l) => <SortableTh sortKey={k} currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>{l}</SortableTh>
 
-  // /accstatz returns { account_statz: [ { acc, name, conns, leafnodes, num_subscriptions, ... } ] }
-  // Map to a normalized shape so the table columns are consistent.
-  const accounts = (data?.account_statz ?? []).map(a => ({
-    account_name:       a.acc ?? a.name ?? '',
-    client_connections: a.conns ?? 0,
-    leafnode_connections: a.leafnodes ?? 0,
-    subscriptions:      a.num_subscriptions ?? 0,
-    sent_msgs:          a.sent?.msgs ?? 0,
-    recv_msgs:          a.received?.msgs ?? 0,
-  }))
-
-  const { sortedData: sortedAccounts, sortBy, sortDir, handleSort } = useTableSort(accounts, {
-    defaultSortBy: 'account_name',
-    getSortValue: (a, key) => {
-      if (key === 'account_name') return a.account_name ?? ''
-      if (key === 'clients') return a.client_connections ?? 0
-      if (key === 'leafnodes') return a.leafnode_connections ?? 0
-      if (key === 'subscriptions') return a.subscriptions ?? 0
-      if (key === 'sent_msgs') return a.sent_msgs ?? 0
-      if (key === 'recv_msgs') return a.recv_msgs ?? 0
-      return ''
-    },
-  })
-
-  if (data?._unavailable) return <NatsProtocolNotice endpoint="accstatz" />
-  if (error) return <div className="p-6"><AlertBanner variant="error" title="Error">{error}</AlertBanner></div>
-  if (!data) return <div className="p-6 text-muted-foreground">Loading...</div>
+  if (!accounts.length) {
+    return <div className="surface-card"><EmptyState icon={Users} title="No account statistics" description="No accounts were reported by this server." /></div>
+  }
 
   return (
     <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <MetricCard label="Accounts" value={formatNumber(accounts.length)} />
+        <MetricCard label="Connections" value={formatNumber(accounts.reduce((s, a) => s + a.conns, 0))} />
+        <MetricCard label="Subscriptions" value={formatNumber(accounts.reduce((s, a) => s + a.subs, 0))} />
+        <MetricCard label="Slow consumers" value={formatNumber(accounts.reduce((s, a) => s + a.slow, 0))} tone={accounts.some((a) => a.slow) ? 'warn' : 'default'} />
+      </div>
       <div className="premium-table-wrap">
         <table className="premium-table">
-          <thead>
-            <tr>
-              <SortableTh sortKey="account_name" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Account</SortableTh>
-              <SortableTh sortKey="clients" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Clients</SortableTh>
-              <SortableTh sortKey="leafnodes" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Leafnodes</SortableTh>
-              <SortableTh sortKey="subscriptions" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Subscriptions</SortableTh>
-              <SortableTh sortKey="sent_msgs" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Msgs Sent</SortableTh>
-              <SortableTh sortKey="recv_msgs" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Msgs Recv</SortableTh>
-            </tr>
-          </thead>
+          <thead><tr>{th('name', 'Account')}{th('conns', 'Clients')}{th('leafnodes', 'Leafnodes')}{th('subs', 'Subs')}{th('sentMsgs', 'Msgs sent')}{th('sentBytes', 'Bytes sent')}{th('recvMsgs', 'Msgs received')}{th('recvBytes', 'Bytes received')}{th('slow', 'Slow')}</tr></thead>
           <tbody>
-            {sortedAccounts.map((a) => (
-              <tr key={a.account_name}>
-                <td className="p-3 font-mono font-medium text-foreground">{a.account_name}</td>
-                <td className="p-3">{a.client_connections}</td>
-                <td className="p-3">{a.leafnode_connections}</td>
-                <td className="p-3">{a.subscriptions.toLocaleString()}</td>
-                <td className="p-3 font-mono">{a.sent_msgs.toLocaleString()}</td>
-                <td className="p-3 font-mono">{a.recv_msgs.toLocaleString()}</td>
+            {sortedData.map((a) => (
+              <tr key={a.name}>
+                <td className="max-w-[280px] truncate font-mono text-xs font-medium" title={a.name}>{a.name}</td>
+                <td className="font-mono text-xs">{formatNumber(a.conns)}</td>
+                <td className="font-mono text-xs">{formatNumber(a.leafnodes)}</td>
+                <td className="font-mono text-xs">{formatNumber(a.subs)}</td>
+                <td className="font-mono text-xs" title={formatNumber(a.sentMsgs)}>{formatCompact(a.sentMsgs)}</td>
+                <td className="font-mono text-xs text-muted-foreground">{formatBytes(a.sentBytes)}</td>
+                <td className="font-mono text-xs" title={formatNumber(a.recvMsgs)}>{formatCompact(a.recvMsgs)}</td>
+                <td className="font-mono text-xs text-muted-foreground">{formatBytes(a.recvBytes)}</td>
+                <td className={`font-mono text-xs ${a.slow ? 'text-nats-warn' : 'text-muted-foreground'}`}>{formatNumber(a.slow)}</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
+    </div>
+  )
+}
+
+export function AccountsPage() {
+  const { data, error, refetch } = useNatsPolling('/accstatz?unused=true')
+  return (
+    <div>
+      <PageHeader title="Accounts" icon={Users} description="Per-account connection and traffic statistics" />
+      <PollState data={data} error={error} onRetry={refetch} endpoint="accstatz">
+        {data && <Accounts data={data} />}
+      </PollState>
     </div>
   )
 }

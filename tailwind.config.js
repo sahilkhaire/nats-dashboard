@@ -59,6 +59,7 @@ export default {
   			'nats-ok': 'rgb(var(--nats-ok)    / <alpha-value>)',
   			'nats-warn': 'rgb(var(--nats-warn)  / <alpha-value>)',
   			'nats-error': 'rgb(var(--nats-error) / <alpha-value>)',
+  			'nats-info': 'rgb(var(--nats-info) / <alpha-value>)',
   			'nats-text-primary': 'rgb(var(--nats-text-primary)  / <alpha-value>)',
   			'nats-text-secondary': 'rgb(var(--nats-text-secondary)/ <alpha-value>)',
   			'nats-text-muted': 'rgb(var(--nats-text-muted)    / <alpha-value>)',
@@ -76,7 +77,6 @@ export default {
   		fontFamily: {
   			sans: [
   				'Inter',
-  				'DM Sans',
   				'ui-sans-serif',
   				'system-ui',
   				'sans-serif'
@@ -93,7 +93,7 @@ export default {
   			sm: 'calc(var(--radius) - 4px)'
   		},
   		boxShadow: {
-  			surface: '0 1px 2px rgb(0 0 0 / 0.06), 0 8px 24px rgb(0 0 0 / 0.1)'
+  			surface: '0 1px 2px rgb(0 0 0 / 0.04)'
   		}
   	}
   },

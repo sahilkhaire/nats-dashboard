@@ -1,77 +1,73 @@
+import { Server, ServerCog } from 'lucide-react'
 import { useNatsPolling } from '../../hooks/useNatsPolling'
 import { useTableSort } from '../../hooks/useTableSort'
-import { formatBytes } from '../../utils/byteFormatter'
-import { AlertBanner } from '../../components/AlertBanner'
-import { NatsProtocolNotice } from '../../components/NatsProtocolNotice'
+import { SortableTh } from '../../components/ui/SortableTh'
+import { MetricCard } from '../../components/ui/MetricCard'
+import { StatusBadge } from '../../components/ui/StatusBadge'
+import { PageHeader } from '../../components/shared/PageHeader'
+import { PollState } from '../../components/shared/PageState'
 import { EmptyState } from '../../components/shared/EmptyState'
-import { SortableTh } from '../../components/ui'
-import { GitMerge, ServerCog } from 'lucide-react'
+import { formatBytes, formatCompact, formatNumber } from '../../utils/byteFormatter'
 
-export function ClusterPage() {
-  const { data, error } = useNatsPolling('/routez', 2000)
-
-  const routes = data?.routes ?? []
-  const { sortedData: sortedRoutes, sortBy, sortDir, handleSort } = useTableSort(routes, {
-    defaultSortBy: 'remote_id',
-    getSortValue: (r, key) => {
-      if (key === 'remote_id') return r.remote_id ?? ''
-      if (key === 'ip_port') return `${r.ip ?? ''}:${r.port ?? ''}`
-      if (key === 'in_msgs') return r.in_msgs ?? 0
-      if (key === 'out_msgs') return r.out_msgs ?? 0
-      if (key === 'pending') return r.pending_size ?? 0
-      return ''
-    },
+function Routes({ data, varz }) {
+  const routes = data.routes ?? []
+  const { sortedData, sortBy, sortDir, handleSort } = useTableSort(routes, {
+    defaultSortBy: 'remote_name',
+    getSortValue: (r, key) => (key === 'remote_name' ? (r.remote_name || r.remote_id || '') : key === 'addr' ? `${r.ip}:${r.port}` : r[key] ?? 0),
   })
-
-  if (data?._unavailable) return <NatsProtocolNotice endpoint="routez" />
-  if (error) return <div className="p-6"><AlertBanner variant="error" title="Error">{error}</AlertBanner></div>
-  if (!data) return <div className="p-6 text-muted-foreground">Loading...</div>
+  const th = (k, l) => <SortableTh sortKey={k} currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>{l}</SortableTh>
+  const peers = new Set(routes.map((r) => r.remote_name || r.remote_id)).size
+  const pending = routes.reduce((s, r) => s + (r.pending_size ?? 0), 0)
 
   if (routes.length === 0) {
     return (
-      <div className="p-6">
-        <div className="overflow-hidden rounded-lg border border-border bg-card">
-          <EmptyState
-            icon={ServerCog}
-            title="Standalone mode"
-            description="This NATS server is running standalone with no cluster routes. Cluster routes appear when you connect multiple NATS servers in a cluster."
-            hint="To run in cluster mode, configure multiple NATS servers with route URLs."
-          />
-        </div>
+      <div className="surface-card">
+        <EmptyState icon={ServerCog} title="Standalone server" description="No cluster routes are configured. Routes appear when several NATS servers form a cluster."
+          hint="Configure a cluster block with routes in each server's config to cluster them." />
       </div>
     )
   }
 
   return (
     <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <MetricCard label="Cluster" value={<span className="text-lg">{varz?.cluster?.name || '—'}</span>} />
+        <MetricCard label="Peers" value={formatNumber(peers)} subtext={`${routes.length} route connections`} />
+        <MetricCard label="Pending" value={formatBytes(pending)} tone={pending > 0 ? 'warn' : 'default'} />
+        <MetricCard label="Routes (total)" value={formatNumber(data.num_routes ?? routes.length)} />
+      </div>
       <div className="premium-table-wrap">
-        <div className="flex items-center gap-2 border-b border-border bg-card px-4 py-2.5">
-          <GitMerge size={14} className="text-foreground/70" />
-          <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Cluster routes ({routes.length})</span>
-        </div>
         <table className="premium-table">
-          <thead>
-            <tr>
-              <SortableTh sortKey="remote_id" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Remote ID</SortableTh>
-              <SortableTh sortKey="ip_port" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>IP:Port</SortableTh>
-              <SortableTh sortKey="in_msgs" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Msgs In</SortableTh>
-              <SortableTh sortKey="out_msgs" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Msgs Out</SortableTh>
-              <SortableTh sortKey="pending" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Pending</SortableTh>
-            </tr>
-          </thead>
+          <thead><tr>{th('remote_name', 'Peer')}{th('addr', 'Address')}{th('rtt', 'RTT')}{th('in_msgs', 'Msgs in')}{th('out_msgs', 'Msgs out')}{th('subscriptions', 'Subs')}{th('pending_size', 'Pending')}<th>Direction</th></tr></thead>
           <tbody>
-            {sortedRoutes.map((r) => (
+            {sortedData.map((r) => (
               <tr key={r.rid ?? `${r.remote_id}-${r.ip}-${r.port}`}>
-                <td className="p-3 font-mono">{r.remote_id}</td>
-                <td className="p-3">{r.ip}:{r.port}</td>
-                <td className="p-3 font-mono">{(r.in_msgs ?? 0).toLocaleString()}</td>
-                <td className="p-3 font-mono">{(r.out_msgs ?? 0).toLocaleString()}</td>
-                <td className={`p-3 ${(r.pending_size ?? 0) > 0 ? 'text-foreground' : ''}`}>{formatBytes(r.pending_size)}</td>
+                <td className="font-mono text-xs"><div className="font-medium">{r.remote_name || '—'}</div><div className="text-[11px] text-muted-foreground">{r.remote_id?.slice(0, 12)}…</div></td>
+                <td className="font-mono text-xs">{r.ip}:{r.port}</td>
+                <td className="font-mono text-xs text-muted-foreground">{r.rtt || '—'}</td>
+                <td className="font-mono text-xs" title={formatNumber(r.in_msgs)}>{formatCompact(r.in_msgs ?? 0)}</td>
+                <td className="font-mono text-xs" title={formatNumber(r.out_msgs)}>{formatCompact(r.out_msgs ?? 0)}</td>
+                <td className="font-mono text-xs">{formatNumber(r.subscriptions ?? 0)}</td>
+                <td className={`font-mono text-xs ${(r.pending_size ?? 0) > 0 ? 'text-nats-warn' : 'text-muted-foreground'}`}>{formatBytes(r.pending_size ?? 0)}</td>
+                <td><StatusBadge status={r.did_solicit ? 'info' : 'neutral'}>{r.did_solicit ? 'outbound' : 'inbound'}</StatusBadge></td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
+    </div>
+  )
+}
+
+export function ClusterPage() {
+  const { data, error, refetch } = useNatsPolling('/routez')
+  const { data: varz } = useNatsPolling('/varz')
+  return (
+    <div>
+      <PageHeader title="Cluster" icon={Server} description="Route connections to the other servers in this cluster" />
+      <PollState data={data} error={error} onRetry={refetch} endpoint="routez">
+        {data && <Routes data={data} varz={varz} />}
+      </PollState>
     </div>
   )
 }

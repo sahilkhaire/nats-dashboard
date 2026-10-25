@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { useRef } from 'react'
 
 /** Stable id for maps — LIST payloads sometimes omit top-level `name`. */
 export function consumerRowKey(c) {
-  const n = c?.name ?? c?.config?.durable_name
+  const n = c?.name ?? c?.config?.durable_name ?? c?.config?.name
   return n != null && String(n) !== '' ? String(n) : null
 }
 
@@ -14,152 +14,123 @@ function seqScalar(obj) {
   return Number.isFinite(n) ? n : null
 }
 
-/** Incoming: messages delivered to the consumer. */
-function deliveredScalar(consumer) {
-  return seqScalar(consumer?.delivered)
-}
-
-/** Outgoing: messages acknowledged (ack floor). */
-function ackFloorScalar(consumer) {
-  return seqScalar(consumer?.ack_floor)
-}
-
 export function formatAckRate(n) {
   if (n == null || Number.isNaN(n)) return '—'
-  if (n >= 100) return `${Math.round(n)} msg/s`
-  return `${n.toFixed(1)} msg/s`
+  if (n === 0) return '0 msg/s'
+  if (n >= 100) return `${Math.round(n).toLocaleString()} msg/s`
+  if (n >= 10) return `${n.toFixed(1)} msg/s`
+  return `${n.toFixed(2)} msg/s`
+}
+
+/** Key used in the rate maps: "stream/consumer" when the row carries its stream. */
+export function consumerRateKey(c) {
+  const name = consumerRowKey(c)
+  if (!name) return null
+  return c?.stream ? `${c.stream}/${name}` : name
+}
+
+export const DEFAULT_RATE_WINDOW_MS = 30_000
+
+/** Window stores survive page navigation (keyed per connection). */
+const stores = new Map()
+
+const EMPTY = Object.freeze({
+  inRatesByName: new Map(),
+  outRatesByName: new Map(),
+  combinedInRate: null,
+  combinedOutRate: null,
+  windowMs: DEFAULT_RATE_WINDOW_MS,
+  spanMs: 0,
+})
+
+function windowRate(samples, field) {
+  // Use the oldest and newest sample in the window that both carry the counter.
+  let first = null
+  let last = null
+  for (const s of samples) {
+    if (s[field] == null) continue
+    if (!first) first = s
+    last = s
+  }
+  if (!first || !last || last.t <= first.t) return null
+  return Math.max(0, (last[field] - first[field]) / ((last.t - first.t) / 1000))
 }
 
 /**
- * Per-consumer incoming (delivered) and outgoing (ack) rates between polls.
+ * Sliding-window delivery (incoming) and acknowledgement (outgoing) rates per consumer.
  *
- * rate = (current - previous) / (refreshIntervalMs / 1000)
+ * Every poll adds a sample { t, delivered, ackFloor } per consumer. Samples older than
+ * `windowMs` are evicted (keeping one just outside the window so slow polls still yield
+ * a rate). The rate is the counter delta across the window divided by its real duration:
  *
- * Consumers with sequence 0 or no positive delta are omitted (shown as —),
- * so idle rows do not pull combined rates to 0.0.
+ *   rate = (seq_newest - seq_oldest) / (t_newest - t_oldest)
+ *
+ * This smooths bursty traffic, reports a true 0 for idle consumers once two samples exist,
+ * and resets cleanly when a counter goes backwards (consumer recreated).
+ *
+ * @param {object[]} consumers — consumer_detail rows (with optional `stream`)
+ * @param {number} lastFetch — timestamp of the poll that produced `consumers`
+ * @param {string} cacheKey — scope for the stored window (e.g. connection id + stream)
+ * @param {{ windowMs?: number }} [options]
  */
-export function useConsumerAckRates(consumers, lastFetch, streamKey, refreshIntervalMs) {
-  const [result, setResult] = useState({
-    inRatesByName: new Map(),
-    outRatesByName: new Map(),
-    combinedInRate: null,
-    combinedOutRate: null,
-    // back-compat aliases used by older call sites
-    ratesByName: new Map(),
-    combinedRate: null,
-  })
-  const prevByKey = useRef(new Map()) // key -> { delivered, ackFloor }
-  const lastPollTs = useRef(null)
-  const streamKeyRef = useRef(streamKey)
+export function useConsumerAckRates(consumers, lastFetch, cacheKey, { windowMs = DEFAULT_RATE_WINDOW_MS } = {}) {
+  const localRef = useRef(null)
+  const key = cacheKey ?? null
+  if (key === null && !localRef.current) localRef.current = { processedAt: null, samples: new Map(), result: EMPTY }
+  const st = key !== null
+    ? (stores.get(key) ?? (stores.set(key, { processedAt: null, samples: new Map(), result: EMPTY }), stores.get(key)))
+    : localRef.current
 
-  useEffect(() => {
-    if (streamKeyRef.current !== streamKey) {
-      streamKeyRef.current = streamKey
-      prevByKey.current = new Map()
-      lastPollTs.current = null
+  if (lastFetch == null || !consumers) return st.result
+  if (st.processedAt != null && lastFetch <= st.processedAt) return st.result
+
+  const inRatesByName = new Map()
+  const outRatesByName = new Map()
+  const nextSamples = new Map()
+  let sumIn = 0
+  let sumOut = 0
+  let anyIn = false
+  let anyOut = false
+  let spanMs = 0
+
+  for (const c of consumers) {
+    const id = consumerRateKey(c)
+    if (!id) continue
+    const delivered = seqScalar(c.delivered)
+    const ackFloor = seqScalar(c.ack_floor)
+    let samples = st.samples.get(id) ?? []
+
+    const prev = samples[samples.length - 1]
+    if (prev && ((delivered != null && prev.delivered != null && delivered < prev.delivered)
+      || (ackFloor != null && prev.ackFloor != null && ackFloor < prev.ackFloor))) {
+      samples = [] // counters went backwards: consumer was recreated
     }
+    samples = [...samples, { t: lastFetch, delivered, ackFloor }]
 
-    if (lastFetch == null || !consumers?.length || !Number.isFinite(refreshIntervalMs) || refreshIntervalMs <= 0) {
-      if (!consumers?.length) {
-        prevByKey.current = new Map()
-        lastPollTs.current = null
-      }
-      const empty = {
-        inRatesByName: new Map(),
-        outRatesByName: new Map(),
-        combinedInRate: null,
-        combinedOutRate: null,
-        ratesByName: new Map(),
-        combinedRate: null,
-      }
-      setResult(empty)
-      return
-    }
+    // Evict samples older than the window, keeping one boundary sample.
+    const cutoff = lastFetch - windowMs
+    while (samples.length > 2 && samples[1].t <= cutoff) samples.shift()
+    nextSamples.set(id, samples)
 
-    if (lastPollTs.current === lastFetch) {
-      return
-    }
-    lastPollTs.current = lastFetch
+    const inRate = windowRate(samples, 'delivered')
+    const outRate = windowRate(samples, 'ackFloor')
+    inRatesByName.set(id, inRate)
+    outRatesByName.set(id, outRate)
+    if (inRate != null) { sumIn += inRate; anyIn = true }
+    if (outRate != null) { sumOut += outRate; anyOut = true }
+    if (samples.length > 1) spanMs = Math.max(spanMs, samples[samples.length - 1].t - samples[0].t)
+  }
 
-    const dtSec = refreshIntervalMs / 1000
-    const inRatesByName = new Map()
-    const outRatesByName = new Map()
-    const seen = new Set()
-    let anyIn = false
-    let anyOut = false
-    let sumIn = 0
-    let sumOut = 0
-
-    for (const c of consumers) {
-      const key = consumerRowKey(c)
-      if (!key) continue
-      seen.add(key)
-
-      const delivered = deliveredScalar(c)
-      const ackFloor = ackFloorScalar(c)
-      const previous = prevByKey.current.get(key)
-
-      // Incoming (delivered)
-      if (delivered != null && delivered > 0 && previous?.delivered != null && previous.delivered > 0) {
-        const delta = delivered - previous.delivered
-        if (delta > 0) {
-          const rate = delta / dtSec
-          inRatesByName.set(key, rate)
-          anyIn = true
-          sumIn += rate
-        } else {
-          inRatesByName.set(key, null)
-        }
-      } else {
-        inRatesByName.set(key, null)
-      }
-
-      // Outgoing (ack floor)
-      if (ackFloor != null && ackFloor > 0 && previous?.ackFloor != null && previous.ackFloor > 0) {
-        const delta = ackFloor - previous.ackFloor
-        if (delta > 0) {
-          const rate = delta / dtSec
-          outRatesByName.set(key, rate)
-          anyOut = true
-          sumOut += rate
-        } else {
-          outRatesByName.set(key, null)
-        }
-      } else {
-        outRatesByName.set(key, null)
-      }
-
-      // Baselines only for sequences that have started
-      const nextPrev = {
-        delivered: delivered != null && delivered > 0 ? delivered : undefined,
-        ackFloor: ackFloor != null && ackFloor > 0 ? ackFloor : undefined,
-      }
-      if (nextPrev.delivered != null || nextPrev.ackFloor != null) {
-        prevByKey.current.set(key, {
-          delivered: nextPrev.delivered ?? previous?.delivered,
-          ackFloor: nextPrev.ackFloor ?? previous?.ackFloor,
-        })
-      } else {
-        prevByKey.current.delete(key)
-      }
-    }
-
-    for (const k of [...prevByKey.current.keys()]) {
-      if (!seen.has(k)) prevByKey.current.delete(k)
-    }
-
-    const combinedInRate = anyIn ? sumIn : null
-    const combinedOutRate = anyOut ? sumOut : null
-
-    setResult({
-      inRatesByName,
-      outRatesByName,
-      combinedInRate,
-      combinedOutRate,
-      ratesByName: outRatesByName,
-      combinedRate: combinedOutRate,
-    })
-  }, [consumers, lastFetch, streamKey, refreshIntervalMs])
-
+  const result = {
+    inRatesByName,
+    outRatesByName,
+    combinedInRate: anyIn ? sumIn : null,
+    combinedOutRate: anyOut ? sumOut : null,
+    windowMs,
+    spanMs,
+  }
+  const next = { processedAt: lastFetch, samples: nextSamples, result }
+  if (key !== null) stores.set(key, next)
+  else localRef.current = next
   return result
 }

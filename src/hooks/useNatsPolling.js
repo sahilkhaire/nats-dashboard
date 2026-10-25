@@ -3,17 +3,21 @@ import { useConfig } from '../context/ConfigContext'
 import { usePolling } from './usePolling'
 
 /**
- * Polls a NATS monitoring endpoint.
- * In dev: proxied through Vite plugin (uses NATS protocol, port 4222).
- * In prod: direct HTTP to monitoring port 8222.
+ * Polls a NATS monitoring endpoint (/varz, /jsz, …) through the dashboard proxy
+ * for the selected connection.
+ *
+ * @param {string} path — monitoring path, e.g. "/jsz?streams=true"
+ * @param {number} [interval] — ms; defaults to the global refresh interval
+ * @param {{ enabled?: boolean, multiplier?: number }} [options]
  */
 export function useNatsPolling(path, interval, options = {}) {
-  const { getNatsUrl, authToken, serverUrl } = useConfig()
-  // Don't generate a URL (and therefore don't poll) until a real server URL is set
-  const url = serverUrl ? getNatsUrl(path) : null
+  const { connection, getNatsUrl, pollInterval, paused } = useConfig()
+  const { enabled = true, multiplier = 1 } = options
+  const url = connection ? getNatsUrl(path) : null
   const headers = useMemo(
-    () => (authToken ? { Authorization: `Bearer ${authToken}` } : {}),
-    [authToken]
+    () => (connection?.token ? { Authorization: `Bearer ${connection.token}` } : undefined),
+    [connection?.token],
   )
-  return usePolling(url, interval, { ...options, headers })
+  const effectiveInterval = (interval ?? pollInterval) * multiplier
+  return usePolling(url, effectiveInterval, { enabled: enabled && !paused, headers })
 }

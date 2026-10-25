@@ -1,69 +1,70 @@
+import { Leaf } from 'lucide-react'
 import { useNatsPolling } from '../../hooks/useNatsPolling'
 import { useTableSort } from '../../hooks/useTableSort'
-import { AlertBanner } from '../../components/AlertBanner'
-import { NatsProtocolNotice } from '../../components/NatsProtocolNotice'
+import { SortableTh } from '../../components/ui/SortableTh'
+import { MetricCard } from '../../components/ui/MetricCard'
+import { PageHeader } from '../../components/shared/PageHeader'
+import { PollState } from '../../components/shared/PageState'
 import { EmptyState } from '../../components/shared/EmptyState'
-import { SortableTh } from '../../components/ui'
-import { Leaf } from 'lucide-react'
+import { formatBytes, formatCompact, formatNumber } from '../../utils/byteFormatter'
 
-export function LeafNodesPage() {
-  const { data, error } = useNatsPolling('/leafz', 2000)
-
-  const leafs = data?.leafs ?? []
-  const { sortedData: sortedLeafs, sortBy, sortDir, handleSort } = useTableSort(leafs, {
-    defaultSortBy: 'account',
-    getSortValue: (l, key) => {
-      if (key === 'account') return l.account ?? ''
-      if (key === 'ip_port') return `${l.ip ?? ''}:${l.port ?? ''}`
-      if (key === 'in_msgs') return l.in_msgs ?? 0
-      if (key === 'out_msgs') return l.out_msgs ?? 0
-      return ''
-    },
+function Leafs({ data }) {
+  const leafs = data.leafs ?? []
+  const { sortedData, sortBy, sortDir, handleSort } = useTableSort(leafs, {
+    defaultSortBy: 'name',
+    getSortValue: (l, key) => (key === 'addr' ? `${l.ip}:${l.port}` : l[key] ?? (key === 'name' || key === 'account' ? '' : 0)),
   })
-
-  if (data?._unavailable) return <NatsProtocolNotice endpoint="leafz" />
-  if (error) return <div className="p-6"><AlertBanner variant="error" title="Error">{error}</AlertBanner></div>
-  if (!data) return <div className="p-6 text-muted-foreground">Loading...</div>
+  const th = (k, l) => <SortableTh sortKey={k} currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>{l}</SortableTh>
 
   if (leafs.length === 0) {
     return (
-      <div className="p-6">
-        <div className="overflow-hidden rounded-lg border border-border bg-card">
-          <EmptyState
-            icon={Leaf}
-            title="No leaf nodes connected"
-            description="Leaf nodes are lightweight NATS servers that bridge to this hub. They're often used for edge computing, remote offices, or IoT devices."
-            hint="Configure leaf nodes in your NATS config to connect remote NATS instances."
-          />
-        </div>
+      <div className="surface-card">
+        <EmptyState icon={Leaf} title="No leaf nodes connected" description="Leaf nodes extend this server to edge sites, remote offices or devices."
+          hint="Configure a leafnodes block to accept or create leaf node connections." />
       </div>
     )
   }
 
   return (
     <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <MetricCard label="Leaf nodes" value={formatNumber(leafs.length)} />
+        <MetricCard label="Accounts" value={formatNumber(new Set(leafs.map((l) => l.account)).size)} />
+        <MetricCard label="Msgs in" value={formatCompact(leafs.reduce((s, l) => s + (l.in_msgs ?? 0), 0))} />
+        <MetricCard label="Msgs out" value={formatCompact(leafs.reduce((s, l) => s + (l.out_msgs ?? 0), 0))} />
+      </div>
       <div className="premium-table-wrap">
         <table className="premium-table">
-          <thead>
-            <tr>
-              <SortableTh sortKey="account" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Account</SortableTh>
-              <SortableTh sortKey="ip_port" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>IP:Port</SortableTh>
-              <SortableTh sortKey="in_msgs" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Msgs In</SortableTh>
-              <SortableTh sortKey="out_msgs" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Msgs Out</SortableTh>
-            </tr>
-          </thead>
+          <thead><tr>{th('name', 'Name')}{th('account', 'Account')}{th('addr', 'Address')}{th('rtt', 'RTT')}{th('in_msgs', 'Msgs in')}{th('out_msgs', 'Msgs out')}{th('in_bytes', 'Bytes in')}{th('out_bytes', 'Bytes out')}{th('subscriptions', 'Subs')}</tr></thead>
           <tbody>
-            {sortedLeafs.map((l) => (
+            {sortedData.map((l) => (
               <tr key={`${l.account}-${l.ip}:${l.port}`}>
-                <td className="p-3">{l.account}</td>
-                <td className="p-3 font-mono">{l.ip}:{l.port}</td>
-                <td className="p-3 font-mono">{(l.in_msgs ?? 0).toLocaleString()}</td>
-                <td className="p-3 font-mono">{(l.out_msgs ?? 0).toLocaleString()}</td>
+                <td className="font-mono text-xs font-medium">{l.name || '—'}</td>
+                <td className="font-mono text-xs">{l.account}</td>
+                <td className="font-mono text-xs">{l.ip}:{l.port}</td>
+                <td className="font-mono text-xs text-muted-foreground">{l.rtt || '—'}</td>
+                <td className="font-mono text-xs">{formatCompact(l.in_msgs ?? 0)}</td>
+                <td className="font-mono text-xs">{formatCompact(l.out_msgs ?? 0)}</td>
+                <td className="font-mono text-xs text-muted-foreground">{formatBytes(l.in_bytes ?? 0)}</td>
+                <td className="font-mono text-xs text-muted-foreground">{formatBytes(l.out_bytes ?? 0)}</td>
+                <td className="font-mono text-xs">{formatNumber(l.subscriptions ?? 0)}</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
+    </div>
+  )
+}
+
+export function LeafNodesPage() {
+  const { data, error, refetch } = useNatsPolling('/leafz')
+  return (
+    <div>
+      <PageHeader title="Leaf Nodes" icon={Leaf} description="Leaf node connections bridged to this server" />
+      <PollState data={data} error={error} onRetry={refetch} endpoint="leafz">
+        {data && <Leafs data={data} />}
+      </PollState>
     </div>
   )
 }

@@ -1,226 +1,94 @@
-import { useState, useMemo } from 'react'
-import { useNatsPolling } from '../../hooks/useNatsPolling'
-import { useTableSort } from '../../hooks/useTableSort'
-import { usePagination } from '../../hooks/usePagination'
-import { AlertBanner } from '../../components/AlertBanner'
-import { RefreshSelector } from '../../components/RefreshSelector'
-import { SortableTh } from '../../components/ui'
-import { PaginationBar } from '../../components/shared/PaginationBar'
-
-const formatFloor = (floor) => {
-  if (!floor) return '—'
-  return (floor.stream_seq ?? floor.consumer_seq ?? 0).toLocaleString()
-}
-
-const formatPausedUntil = (consumer) => {
-  if (!consumer?.paused) return '—'
-  const raw =
-    consumer.pause_remaining ??
-    consumer.paused_until ??
-    consumer.pause_until ??
-    consumer.config?.pause_until
-  if (!raw) return 'Paused'
-  if (typeof raw === 'number') return `${raw.toLocaleString()}ns`
-  const parsed = Date.parse(raw)
-  if (Number.isNaN(parsed)) return String(raw)
-  return new Date(parsed).toLocaleString()
-}
-
-const metricColorClass = (value, warnAt, dangerAt) => {
-  if (value >= dangerAt) return 'text-nats-error'
-  if (value >= warnAt) return 'text-nats-warn'
-  return 'text-muted-foreground'
-}
+import { useMemo, useState } from 'react'
+import { Waves } from 'lucide-react'
+import { useJetStreamData } from '../../hooks/useJetStreamData'
+import { useConsumerAckRates, formatAckRate } from '../../hooks/useConsumerAckRates'
+import { useConfig } from '../../context/ConfigContext'
+import { useStreamMutation } from '../../hooks/useStreamMutation'
+import { useConfirmDialog } from '../../components/shared/ConfirmDialogProvider'
+import { useNotifications } from '../../context/NotificationContext'
+import { ConsumerTable, consumerHealth } from '../../components/consumers/ConsumerTable'
+import { MetricCard } from '../../components/ui/MetricCard'
+import { PageHeader } from '../../components/shared/PageHeader'
+import { PollState } from '../../components/shared/PageState'
+import { SearchInput, makeMatcher } from '../../components/shared/SearchInput'
+import { EmptyState } from '../../components/shared/EmptyState'
+import { formatCompact, formatNumber } from '../../utils/byteFormatter'
 
 export function ConsumersPage() {
-  const [refreshInterval, setRefreshInterval] = useState(2000)
-  const { data, error, lastFetch } = useNatsPolling('/jsz?accounts=true&streams=true&consumers=true&config=true', refreshInterval)
-
-  // ── Filter state ──
+  const { data, error, refetch, consumers, lastFetch } = useJetStreamData()
+  const { connection } = useConfig()
+  const rates = useConsumerAckRates(consumers, lastFetch, `${connection?.id}:all`)
+  const { deleteConsumer } = useStreamMutation()
+  const { confirm } = useConfirmDialog()
+  const { notifyError, notifySuccess } = useNotifications()
   const [search, setSearch] = useState('')
   const [useRegex, setUseRegex] = useState(false)
-  const [regexError, setRegexError] = useState('')
   const [filterStream, setFilterStream] = useState('all')
+  const [filterHealth, setFilterHealth] = useState('all')
 
-  const consumers = useMemo(() => {
-    const list = []
-    if (data) {
-      for (const acc of data.account_details ?? []) {
-        for (const sd of acc.stream_detail ?? []) {
-          for (const c of sd.consumer_detail ?? []) {
-            list.push({ ...c, stream: sd.name })
-          }
-        }
-      }
+  const streamNames = useMemo(() => [...new Set(consumers.map((c) => c.stream))].sort(), [consumers])
+  const matcher = makeMatcher(search, useRegex)
+
+  const filtered = useMemo(() => consumers.filter((c) =>
+    (matcher.test(c.name) || matcher.test(c.stream) || matcher.test(c.config?.filter_subject))
+    && (filterStream === 'all' || c.stream === filterStream)
+    && (filterHealth === 'all' || (filterHealth === 'attention' ? consumerHealth(c).status !== 'ok' : consumerHealth(c).status === 'ok'))),
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  [consumers, search, useRegex, filterStream, filterHealth])
+
+
+  const attention = consumers.filter((c) => consumerHealth(c).status !== 'ok').length
+  const pending = consumers.reduce((s, c) => s + (c.num_pending ?? 0), 0)
+  const unacked = consumers.reduce((s, c) => s + (c.num_ack_pending ?? 0), 0)
+
+  const handleDelete = async (c) => {
+    const ok = await confirm(`Delete consumer "${c.name}" on "${c.stream}"?`, 'Clients bound to it will stop receiving messages. Its delivery state is lost.', { confirmLabel: 'Delete consumer' })
+    if (!ok) return
+    try {
+      await deleteConsumer(c.stream, c.name)
+      notifySuccess('Consumer deleted', `"${c.name}" was removed.`, 'consumer')
+      refetch()
+    } catch (err) {
+      notifyError('Delete failed', err.message, 'consumer')
     }
-    return list
-  }, [data])
-
-  const streamNames = useMemo(() => {
-    const names = [...new Set(consumers.map(c => c.stream))].sort()
-    return names
-  }, [consumers])
-
-  const filtered = useMemo(() => {
-    setRegexError('')
-    let list = consumers
-    if (search.trim()) {
-      if (useRegex) {
-        try {
-          const re = new RegExp(search, 'i')
-          list = list.filter(c => re.test(c.name) || re.test(c.stream))
-        } catch {
-          setRegexError('Invalid regex')
-          return list
-        }
-      } else {
-        const q = search.toLowerCase()
-        list = list.filter(c =>
-          c.name.toLowerCase().includes(q) || c.stream.toLowerCase().includes(q)
-        )
-      }
-    }
-    if (filterStream !== 'all') list = list.filter(c => c.stream === filterStream)
-    return list
-  }, [consumers, search, useRegex, filterStream])
-
-  const { sortedData: sortedConsumers, sortBy, sortDir, handleSort } = useTableSort(filtered, {
-    defaultSortBy: 'stream',
-    getSortValue: (c, key) => {
-      if (key === 'stream')       return c.stream ?? ''
-      if (key === 'consumer')     return c.name ?? ''
-      if (key === 'filter_subjects') return c.config?.filter_subject || c.config?.filter_subjects?.join(',') || ''
-      if (key === 'ack_policy')   return c.config?.ack_policy ?? ''
-      if (key === 'deliver_policy') return c.config?.deliver_policy ?? ''
-      if (key === 'pending')      return c.num_pending ?? 0
-      if (key === 'ack_pending')  return c.num_ack_pending ?? 0
-      if (key === 'ack_floor')    return c.ack_floor?.consumer_seq ?? 0
-      if (key === 'redelivered')  return c.num_redelivered ?? 0
-      if (key === 'num_waiting')  return c.num_waiting ?? 0
-      if (key === 'paused_until') return c.paused ? 1 : 0
-      return ''
-    },
-  })
-
-  const { pagedData, page, pageSize, totalPages, totalItems, setPage, setPageSize } = usePagination(sortedConsumers, 10)
-
-  const lagging = consumers.filter(c => (c.num_pending ?? 0) > 1000 || (c.num_ack_pending ?? 0) > 0)
-
-  if (error) return <div className="p-6"><AlertBanner variant="error" title="Error">{error}</AlertBanner></div>
-  if (!data) return <div className="p-6 text-nats-text-secondary">Loading...</div>
+  }
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold text-nats-text-secondary uppercase tracking-wide">
-          {consumers.length} Consumer{consumers.length !== 1 ? 's' : ''}
-        </h2>
-        <RefreshSelector interval={refreshInterval} onChange={setRefreshInterval} lastFetch={lastFetch} />
-      </div>
+    <div>
+      <PageHeader title="Consumers" icon={Waves} description="Delivery progress of every JetStream consumer" />
+      <PollState data={data} error={error} onRetry={refetch}>
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+            <MetricCard label="Consumers" value={formatNumber(consumers.length)} subtext={`across ${streamNames.length} streams`} />
+            <MetricCard label="Needs attention" value={formatNumber(attention)} tone={attention ? 'warn' : 'ok'} subtext="lagging, stalled or redelivering" />
+            <MetricCard label="Pending" value={formatCompact(pending)} subtext="messages not yet delivered" />
+            <MetricCard label="Acked / s" value={formatAckRate(rates.combinedOutRate)}
+              subtext={rates.spanMs > 0 ? `delivered ${formatAckRate(rates.combinedInRate)} · ${Math.round(rates.spanMs / 1000)}s avg` : 'collecting samples…'} />
+          </div>
 
-      {/* ── Filter bar ── */}
-      <div className="flex flex-wrap gap-2 items-center">
-        <div className="flex flex-1 min-w-[200px] items-center gap-1 rounded border border-border bg-card px-3 py-2">
-          <input
-            type="text"
-            placeholder="Filter by consumer or stream name…"
-            value={search}
-            onChange={e => { setSearch(e.target.value); setPage(1) }}
-            className="flex-1 bg-transparent text-sm text-foreground outline-none placeholder:text-muted-foreground"
-          />
-          <label className="ml-2 flex shrink-0 cursor-pointer select-none items-center gap-1 text-xs text-muted-foreground">
-            <input
-              type="checkbox"
-              checked={useRegex}
-              onChange={e => { setUseRegex(e.target.checked); setPage(1) }}
-              className="accent-nats-accent"
-            />
-            Regex
-          </label>
+          <div className="flex flex-wrap items-start gap-2">
+            <SearchInput value={search} onChange={(v) => { setSearch(v) }} placeholder="Filter by consumer, stream or subject…"
+              regex={useRegex} onRegexChange={setUseRegex} error={matcher.error} className="max-w-md" />
+            <select value={filterStream} onChange={(e) => { setFilterStream(e.target.value) }} className="input-enterprise w-auto" aria-label="Stream">
+              <option value="all">All streams</option>
+              {streamNames.map((n) => <option key={n} value={n}>{n}</option>)}
+            </select>
+            <select value={filterHealth} onChange={(e) => { setFilterHealth(e.target.value) }} className="input-enterprise w-auto" aria-label="Status">
+              <option value="all">Any status</option>
+              <option value="attention">Needs attention</option>
+              <option value="ok">Healthy</option>
+            </select>
+          </div>
+
+          {consumers.length === 0 ? (
+            <div className="surface-card">
+              <EmptyState icon={Waves} title="No consumers" description="Create one from a stream's Consumers tab." />
+            </div>
+          ) : (
+            <ConsumerTable consumers={filtered} showStream rates={rates} onDelete={handleDelete} />
+          )}
         </div>
-        {regexError && <span className="text-xs text-nats-error">{regexError}</span>}
-
-        {streamNames.length > 1 && (
-          <select
-            value={filterStream}
-            onChange={e => { setFilterStream(e.target.value); setPage(1) }}
-            className="input-enterprise h-10 w-auto px-3 py-2"
-          >
-            <option value="all">All Streams</option>
-            {streamNames.map(n => <option key={n} value={n}>{n}</option>)}
-          </select>
-        )}
-
-        {(search || filterStream !== 'all') && (
-          <span className="text-xs text-muted-foreground">
-            {totalItems} of {consumers.length} shown
-          </span>
-        )}
-      </div>
-
-      {lagging.length > 0 && (
-        <AlertBanner variant="warn" title="Consumers with lag or unacked messages">
-          {lagging.length} consumer(s) need attention.
-        </AlertBanner>
-      )}
-
-      <div className="premium-table-wrap">
-        <table className="premium-table">
-          <thead>
-            <tr>
-              <SortableTh sortKey="stream" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Stream</SortableTh>
-              <SortableTh sortKey="consumer" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Consumer</SortableTh>
-              <SortableTh sortKey="filter_subjects" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Filter Subjects</SortableTh>
-              <SortableTh sortKey="ack_floor" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Ack Floor</SortableTh>
-              <SortableTh sortKey="ack_policy" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Ack Policy</SortableTh>
-              <SortableTh sortKey="deliver_policy" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Deliver Policy</SortableTh>
-              <SortableTh sortKey="pending" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Unprocessed Msgs</SortableTh>
-              <SortableTh sortKey="ack_pending" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Outstanding Acks</SortableTh>
-              <SortableTh sortKey="redelivered" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Redelivered Msgs</SortableTh>
-              <SortableTh sortKey="num_waiting" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Waiting Clients</SortableTh>
-              <SortableTh sortKey="paused_until" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Paused Until</SortableTh>
-            </tr>
-          </thead>
-          <tbody>
-            {pagedData.length === 0 ? (
-              <tr>
-                <td colSpan={12} className="p-8 text-center text-muted-foreground">
-                  {consumers.length === 0 ? 'No consumers found.' : 'No consumers match the current filter.'}
-                </td>
-              </tr>
-            ) : pagedData.map((c) => (
-              <tr key={`${c.stream}-${c.name}`}>
-                <td className="p-3 font-mono text-muted-foreground">{c.stream}</td>
-                <td className="p-3 font-mono font-medium text-foreground">{c.name}</td>
-                <td className="p-3 font-mono text-xs text-muted-foreground">
-                  {c.config?.filter_subject || c.config?.filter_subjects?.join(', ') || '—'}
-                </td>
-                <td className="p-3 font-mono text-muted-foreground">{formatFloor(c.ack_floor)}</td>
-                <td className="p-3 text-xs text-muted-foreground">{c.config?.ack_policy ?? '—'}</td>
-                <td className="p-3 text-xs text-muted-foreground">{c.config?.deliver_policy ?? '—'}</td>
-                <td className={`p-3 font-mono ${metricColorClass(c.num_pending ?? 0, 100, 1000)}`}>{(c.num_pending ?? 0).toLocaleString()}</td>
-                <td className={`p-3 font-mono ${metricColorClass(c.num_ack_pending ?? 0, 1, 100)}`}>
-                  {(c.num_ack_pending ?? 0).toLocaleString()}
-                </td>
-                <td className={`p-3 font-mono ${metricColorClass(c.num_redelivered ?? 0, 1, 50)}`}>{c.num_redelivered ?? 0}</td>
-                <td className={`p-3 font-mono ${metricColorClass(c.num_waiting ?? 0, 1, 100)}`}>{(c.num_waiting ?? 0).toLocaleString()}</td>
-                <td className="p-3 text-xs text-muted-foreground">{formatPausedUntil(c)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      {totalPages > 1 && (
-        <PaginationBar
-          page={page}
-          totalPages={totalPages}
-          totalItems={totalItems}
-          pageSize={pageSize}
-          onPage={setPage}
-          onPageSize={setPageSize}
-        />
-      )}
+      </PollState>
     </div>
   )
 }

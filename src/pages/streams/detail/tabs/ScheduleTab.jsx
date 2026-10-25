@@ -1,256 +1,202 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import { CalendarClock, Clock, Flame, Plus, RotateCcw, X as XIcon } from 'lucide-react'
 import { useStreamMutation } from '../../../../hooks/useStreamMutation'
-import { useTableSort } from '../../../../hooks/useTableSort'
-import { SortableTh } from '../../../../components/ui'
-import { Plus, Flame, CalendarClock, Clock, RotateCcw, X as XIcon } from 'lucide-react'
 import { useConfirmDialog } from '../../../../components/shared/ConfirmDialogProvider'
+import { useNotifications } from '../../../../context/NotificationContext'
+import { Button } from '../../../../components/ui/button'
+import { Input } from '../../../../components/ui/input'
+import { StatusBadge } from '../../../../components/ui/StatusBadge'
+import { formatNumber } from '../../../../utils/byteFormatter'
+import { toDateTimeLocal, formatDateTime, timeAgo } from '../../../../utils/duration'
+import { cn } from '../../../../lib/utils'
 
-const INTERVAL_OPTIONS = [
-  { label: '1 hour',  value: 3600000,   display: '1h'  },
-  { label: '6 hours', value: 21600000,  display: '6h'  },
-  { label: '12 hours',value: 43200000,  display: '12h' },
-  { label: '1 day',   value: 86400000,  display: '24h' },
-  { label: '7 days',  value: 604800000, display: '7d'  },
+const INTERVALS = [
+  { label: 'Every hour', value: 3_600_000, display: '1h' },
+  { label: 'Every 6 hours', value: 21_600_000, display: '6h' },
+  { label: 'Every 12 hours', value: 43_200_000, display: '12h' },
+  { label: 'Every day', value: 86_400_000, display: '24h' },
+  { label: 'Every week', value: 604_800_000, display: '7d' },
 ]
 
-function AddScheduleForm({ streamName, onCreate, onCancel }) {
-  const [type,       setType]       = useState('once')
-  const [runAt,      setRunAt]      = useState('')
-  const [intervalMs, setIntervalMs] = useState(INTERVAL_OPTIONS[0].value)
-  const [subject,    setSubject]    = useState('')
-  const [saving,     setSaving]     = useState(false)
-  const [error,      setError]      = useState('')
+const STATUS = { active: 'ok', running: 'warn', done: 'neutral', error: 'error' }
 
-  useEffect(() => {
-    const d = new Date(Date.now() + 3600000); d.setSeconds(0, 0)
-    setRunAt(d.toISOString().slice(0, 16))
-  }, [])
+function ScheduleForm({ streamName, onCreate, onCancel }) {
+  const [type, setType] = useState('once')
+  const [runAt, setRunAt] = useState(() => toDateTimeLocal(new Date(Date.now() + 3_600_000)))
+  const [intervalMs, setIntervalMs] = useState(INTERVALS[3].value)
+  const [subject, setSubject] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
 
-  const handleSave = async () => {
-    setError(''); setSaving(true)
+  const submit = async (e) => {
+    e.preventDefault()
+    setError('')
+    const params = { stream: streamName, type, subject: subject.trim() || undefined }
+    if (type === 'once') {
+      const ts = new Date(runAt)
+      if (!Number.isFinite(ts.getTime()) || ts <= new Date()) { setError('Pick a time in the future.'); return }
+      params.runAt = ts.toISOString()
+    } else {
+      params.intervalMs = intervalMs
+      params.intervalLabel = INTERVALS.find((o) => o.value === intervalMs)?.display
+    }
+    setSaving(true)
     try {
-      const params = { stream: streamName, type, subject: subject.trim() || undefined }
-      if (type === 'once') {
-        if (!runAt) throw new Error('Please pick a date and time')
-        const ts = new Date(runAt)
-        if (ts <= new Date()) throw new Error('Scheduled time must be in the future')
-        params.runAt = ts.toISOString()
-      } else {
-        params.intervalMs    = intervalMs
-        params.intervalLabel = INTERVAL_OPTIONS.find(o => o.value === Number(intervalMs))?.display || `${intervalMs}ms`
-      }
       await onCreate(params)
-    } catch (err) { setError(err.message); setSaving(false) }
+    } catch (err) {
+      setError(err.message)
+      setSaving(false)
+    }
   }
 
   return (
-    <div className="space-y-4 rounded-lg border border-primary/40 bg-card p-4">
-      <div className="text-sm font-semibold text-nats-accent">New Scheduled Purge</div>
-      <div className="flex gap-2">
-        {['once', 'recurring'].map(t => (
-          <button key={t} onClick={() => setType(t)}
-            className={`rounded px-3 py-1.5 text-sm font-medium transition-colors ${type === t ? 'bg-primary text-primary-foreground' : 'border border-border text-muted-foreground hover:border-primary/50'}`}>
-            {t === 'once' ? 'One-time' : 'Recurring'}
+    <form onSubmit={submit} className="space-y-4 border-b border-border bg-muted/30 p-4">
+      <div className="flex rounded-md border border-input bg-background p-0.5 text-xs w-fit">
+        {[['once', 'One-time'], ['recurring', 'Recurring']].map(([id, label]) => (
+          <button key={id} type="button" onClick={() => setType(id)}
+            className={cn('rounded px-3 py-1.5 font-medium', type === id ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:text-foreground')}>
+            {label}
           </button>
         ))}
       </div>
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      <div className="grid gap-4 sm:grid-cols-2">
         {type === 'once' ? (
-          <div>
-            <label className="mb-1 block text-xs text-muted-foreground">Run at</label>
-            <input type="datetime-local" value={runAt} onChange={e => setRunAt(e.target.value)}
-              className="input-enterprise w-full px-2 py-1.5 text-sm" />
-          </div>
+          <div><label className="field-label">Run at</label><Input type="datetime-local" value={runAt} onChange={(e) => setRunAt(e.target.value)} /></div>
         ) : (
           <div>
-            <label className="mb-1 block text-xs text-muted-foreground">Repeat every</label>
-            <select value={intervalMs} onChange={e => setIntervalMs(Number(e.target.value))}
-              className="input-enterprise w-full px-2 py-1.5 text-sm">
-              {INTERVAL_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            <label className="field-label">Repeat</label>
+            <select className="input-enterprise" value={intervalMs} onChange={(e) => setIntervalMs(Number(e.target.value))}>
+              {INTERVALS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
             </select>
           </div>
         )}
-        <div>
-          <label className="mb-1 block text-xs text-muted-foreground">Subject filter <span className="text-muted-foreground">(optional)</span></label>
-          <input type="text" value={subject} onChange={e => setSubject(e.target.value)} placeholder="e.g. orders.> or leave blank for all"
-            className="input-enterprise w-full px-2 py-1.5 font-mono text-sm" />
-        </div>
+        <div><label className="field-label">Subject filter <span className="font-normal">(optional)</span></label><Input value={subject} onChange={(e) => setSubject(e.target.value)} placeholder="all subjects" className="font-mono" /></div>
       </div>
       {error && <div className="text-xs text-nats-error">{error}</div>}
+      <p className="text-[11px] text-muted-foreground">Schedules are kept in the dashboard server&apos;s memory and are lost if it restarts.</p>
       <div className="flex gap-2">
-        <button onClick={handleSave} disabled={saving} className="px-3 py-1.5 rounded bg-nats-accent text-nats-bg text-sm font-semibold hover:opacity-90 disabled:opacity-50">
-          {saving ? 'Saving…' : 'Create schedule'}
-        </button>
-        <button onClick={onCancel} className="rounded border border-border px-3 py-1.5 text-sm text-muted-foreground hover:bg-muted">Cancel</button>
+        <Button type="submit" size="sm" disabled={saving}>{saving ? 'Saving…' : 'Create schedule'}</Button>
+        <Button type="button" size="sm" variant="outline" onClick={onCancel}>Cancel</Button>
       </div>
-    </div>
+    </form>
   )
 }
 
-export function ScheduleTab({ streamName, purgeStream }) {
+export function ScheduleTab({ stream, onPurged }) {
+  const streamName = stream.name
   const { confirm } = useConfirmDialog()
-  const { listSchedules, createSchedule, deleteSchedule } = useStreamMutation()
-  const [schedules,    setSchedules]    = useState([])
-  const [loading,      setLoading]      = useState(true)
-  const [error,        setError]        = useState('')
-  const [showForm,     setShowForm]     = useState(false)
+  const { notifyError, notifySuccess } = useNotifications()
+  const { listSchedules, createSchedule, deleteSchedule, purgeStream } = useStreamMutation()
+  const [schedules, setSchedules] = useState(null)
+  const [error, setError] = useState('')
+  const [showForm, setShowForm] = useState(false)
   const [purgeSubject, setPurgeSubject] = useState('')
-  const [purging,      setPurging]      = useState(false)
-  const [purgeResult,  setPurgeResult]  = useState(null)
-  const [purgeError,   setPurgeError]   = useState('')
+  const [keep, setKeep] = useState('')
+  const [purging, setPurging] = useState(false)
+  const blocked = stream.config?.sealed ? 'Sealed streams cannot be purged.' : stream.config?.deny_purge ? 'Purging is disabled for this stream (deny purge).' : null
 
   const reload = useCallback(async () => {
     try {
-      const list = await listSchedules(streamName)
-      setSchedules(list); setError('')
-    } catch (err) { setError(err.message) }
-    finally { setLoading(false) }
+      setSchedules(await listSchedules(streamName))
+      setError('')
+    } catch (err) {
+      setError(err.message)
+    }
   }, [listSchedules, streamName])
 
-  useEffect(() => { reload() }, [reload])
+  useEffect(() => {
+    reload()
+    const t = setInterval(reload, 10_000)
+    return () => clearInterval(t)
+  }, [reload])
 
-  const handlePurge = async () => {
-    const shouldPurge = await confirm(
-      `Purge messages from "${streamName}"?`,
-      purgeSubject
-        ? `This permanently deletes messages matching subject "${purgeSubject}".`
-        : 'This permanently deletes all messages in the stream.'
-    )
-    if (!shouldPurge) return
-    setPurging(true); setPurgeResult(null); setPurgeError('')
+  const handlePurge = async (e) => {
+    e.preventDefault()
+    const subj = purgeSubject.trim()
+    const keepN = keep.trim() ? Number(keep) : undefined
+    if (keepN != null && (!Number.isInteger(keepN) || keepN < 0)) { notifyError('Invalid value', 'Keep must be a whole number.', 'stream'); return }
+    const what = `${subj ? `messages on "${subj}"` : 'all messages'}${keepN ? `, keeping the newest ${keepN}` : ''}`
+    if (!(await confirm(`Purge ${streamName}?`, `This permanently deletes ${what}.`, { confirmLabel: 'Purge' }))) return
+    setPurging(true)
     try {
-      const result = await purgeStream(streamName, purgeSubject.trim() || undefined)
-      setPurgeResult(result.purged ?? 0)
-    } catch (err) { setPurgeError(err.message) }
-    finally { setPurging(false) }
+      const res = await purgeStream(streamName, subj || undefined, keepN != null ? { keep: keepN } : {})
+      notifySuccess('Purged', `${formatNumber(res.purged ?? 0)} messages removed from ${streamName}.`, 'stream')
+      onPurged?.()
+    } catch (err) {
+      notifyError('Purge failed', err.message, 'stream')
+    } finally {
+      setPurging(false)
+    }
   }
 
-  const handleCreate = async (params) => { await createSchedule(params); setShowForm(false); reload() }
   const handleDelete = async (id) => {
-    const shouldDelete = await confirm(
-      'Cancel scheduled purge?',
-      'The schedule will be removed and no future purge will run from it.'
-    )
-    if (!shouldDelete) return
-    try { await deleteSchedule(id); reload() }
-    catch (err) { setError(err.message) }
+    if (!(await confirm('Cancel scheduled purge?', 'No further purges will run from this schedule.', { confirmLabel: 'Cancel schedule' }))) return
+    try { await deleteSchedule(id); reload() } catch (err) { setError(err.message) }
   }
-
-  const formatNextRun = (s) => {
-    if (s.status === 'done') return 'Completed'
-    if (!s.nextRun) return '—'
-    const diff = new Date(s.nextRun) - Date.now()
-    if (diff < 0) return 'Overdue'
-    if (diff < 60000)   return `in ${Math.round(diff / 1000)}s`
-    if (diff < 3600000) return `in ${Math.round(diff / 60000)}m`
-    if (diff < 86400000) return `in ${Math.round(diff / 3600000)}h`
-    return new Date(s.nextRun).toLocaleString()
-  }
-
-  const { sortedData: sortedSchedules, sortBy, sortDir, handleSort } = useTableSort(schedules, {
-    defaultSortBy: 'nextRun',
-    getSortValue: (s, key) => {
-      if (key === 'type') return s.type ?? ''
-      if (key === 'subject') return s.subject ?? ''
-      if (key === 'nextRun') return s.nextRun ? new Date(s.nextRun).getTime() : 0
-      if (key === 'lastRun') return s.lastRun ? new Date(s.lastRun).getTime() : 0
-      if (key === 'status') return s.status ?? ''
-      return ''
-    },
-  })
 
   return (
-    <div className="space-y-5">
-      {/* Immediate purge */}
-      <div className="overflow-hidden rounded-lg border border-border bg-card">
-        <div className="flex items-center gap-2 border-b border-border bg-card px-4 py-3">
-          <Flame size={14} className="text-nats-error" />
-          <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Purge Now</span>
+    <div className="space-y-4">
+      <form className="surface-card overflow-hidden" onSubmit={handlePurge}>
+        <div className="card-header"><Flame size={13} className="text-nats-error" /><span className="card-title">Purge now</span></div>
+        <div className="space-y-3 p-4">
+          {blocked ? <div className="text-sm text-nats-warn">{blocked}</div> : (
+            <>
+              <p className="text-xs text-muted-foreground">Delete messages immediately. Optionally limit to a subject, or keep the newest N messages.</p>
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <Input value={purgeSubject} onChange={(e) => setPurgeSubject(e.target.value)} placeholder="Subject filter (optional)" className="font-mono" />
+                <Input type="number" min="0" value={keep} onChange={(e) => setKeep(e.target.value)} placeholder="Keep newest N" className="sm:w-40" />
+                <Button type="submit" variant="destructive" disabled={purging} className="shrink-0"><Flame size={14} /> {purging ? 'Purging…' : 'Purge'}</Button>
+              </div>
+            </>
+          )}
         </div>
-        <div className="p-4 space-y-3">
-          <p className="text-xs text-muted-foreground">Immediately delete messages from this stream. Optionally narrow by subject filter.</p>
-          <div className="flex gap-2 items-center">
-            <input type="text" value={purgeSubject} onChange={e => setPurgeSubject(e.target.value)} placeholder="Subject filter (optional, e.g. orders.>)"
-              className="input-enterprise flex-1 px-2 py-1.5 font-mono text-sm" />
-            <button onClick={handlePurge} disabled={purging}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded border border-nats-error/40 hover:bg-nats-error/20 text-nats-error text-sm font-medium disabled:opacity-50 transition-colors whitespace-nowrap">
-              <Flame size={13} />{purging ? 'Purging…' : 'Purge'}
-            </button>
-          </div>
-          {purgeResult !== null && <div className="text-xs text-nats-ok">Purged {purgeResult.toLocaleString()} message{purgeResult !== 1 ? 's' : ''} successfully.</div>}
-          {purgeError && <div className="text-xs text-nats-error">{purgeError}</div>}
-        </div>
-      </div>
+      </form>
 
-      {/* Scheduled purges */}
-      <div className="overflow-hidden rounded-lg border border-border bg-card">
-        <div className="flex items-center justify-between border-b border-border bg-card px-4 py-3">
-          <div className="flex items-center gap-2">
-            <CalendarClock size={14} className="text-muted-foreground" />
-            <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Scheduled Purges</span>
-            {!loading && <span className="text-xs text-muted-foreground">({schedules.length})</span>}
-          </div>
-          <button onClick={() => setShowForm(v => !v)}
-            className="flex items-center gap-1 rounded border border-border px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:border-primary/50 hover:text-primary">
-            <Plus size={12} /> Add
-          </button>
+      <div className="surface-card overflow-hidden">
+        <div className="card-header justify-between">
+          <span className="flex items-center gap-2"><CalendarClock size={13} className="text-muted-foreground" /><span className="card-title">Scheduled purges</span></span>
+          <Button size="sm" variant="outline" onClick={() => setShowForm((v) => !v)} disabled={Boolean(blocked)}><Plus size={13} /> Add</Button>
         </div>
-
         {showForm && (
-          <div className="p-4">
-            <AddScheduleForm streamName={streamName} onCreate={handleCreate} onCancel={() => setShowForm(false)} />
-          </div>
+          <ScheduleForm
+            streamName={streamName}
+            onCancel={() => setShowForm(false)}
+            onCreate={async (params) => {
+              await createSchedule(params)
+              notifySuccess('Schedule created', params.type === 'once' ? `Purge at ${formatDateTime(params.runAt)}` : `Purge ${params.intervalLabel}`, 'stream')
+              setShowForm(false)
+              reload()
+            }}
+          />
         )}
-        {error && <div className="border-b border-border p-3 text-xs text-nats-error">{error}</div>}
-
-        {loading ? (
+        {error && <div className="border-b border-border px-4 py-2 text-xs text-nats-error">{error}</div>}
+        {schedules === null ? (
           <div className="p-4 text-sm text-muted-foreground">Loading…</div>
         ) : schedules.length === 0 ? (
-          <div className="p-8 text-center text-sm text-muted-foreground">No scheduled purges. Click <strong>Add</strong> to create one.</div>
+          <div className="p-8 text-center text-sm text-muted-foreground">No scheduled purges.</div>
         ) : (
-          <table className="w-full text-sm">
-            <thead className="border-b border-border bg-card/60">
-              <tr>
-                <SortableTh sortKey="type" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Type</SortableTh>
-                <SortableTh sortKey="subject" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Subject Filter</SortableTh>
-                <SortableTh sortKey="nextRun" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Next Run</SortableTh>
-                <SortableTh sortKey="lastRun" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Last Run</SortableTh>
-                <SortableTh sortKey="status" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Status</SortableTh>
-                  <th className="w-16 p-3 text-left"></th>
-              </tr>
-            </thead>
-            <tbody>
-              {sortedSchedules.map(s => (
-                <tr key={s.id} className="border-b border-border hover:bg-muted/30">
-                  <td className="p-3">
-                    <div className="flex items-center gap-1.5">
-                      {s.type === 'recurring' ? <RotateCcw size={12} className="text-nats-accent" /> : <Clock size={12} className="text-muted-foreground" />}
-                      <span className="text-xs font-medium">{s.type === 'recurring' ? `Every ${s.intervalLabel}` : 'One-time'}</span>
-                    </div>
-                  </td>
-                  <td className="p-3 font-mono text-xs text-foreground">{s.subject || <span className="text-muted-foreground">all messages</span>}</td>
-                  <td className="p-3 text-xs">{formatNextRun(s)}</td>
-                  <td className="p-3 text-xs text-muted-foreground">{s.lastRun ? new Date(s.lastRun).toLocaleString() : '—'}</td>
-                  <td className="p-3">
-                    <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
-                      s.status === 'done'    ? 'bg-border text-muted-foreground' :
-                      s.status === 'error'   ? 'bg-nats-error/20 text-nats-error' :
-                      s.status === 'running' ? 'bg-nats-warn/20 text-nats-warn' :
-                      'bg-nats-ok/20 text-nats-ok'
-                    }`}>{s.status}</span>
-                    {s.error && <div className="text-xs text-nats-error mt-0.5">{s.error}</div>}
-                  </td>
-                  <td className="p-3">
-                    {s.status !== 'done' && (
-                      <button onClick={() => handleDelete(s.id)} className="rounded p-1 text-muted-foreground transition-colors hover:bg-nats-error/20 hover:text-nats-error" title="Cancel schedule">
-                        <XIcon size={13} />
-                      </button>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <ul className="divide-y divide-border">
+            {schedules.map((s) => (
+              <li key={s.id} className="flex items-start gap-3 px-4 py-3">
+                {s.type === 'recurring' ? <RotateCcw size={14} className="mt-0.5 text-primary" /> : <Clock size={14} className="mt-0.5 text-muted-foreground" />}
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2 text-sm">
+                    <span className="font-medium">{s.type === 'recurring' ? `Every ${s.intervalLabel}` : 'One-time'}</span>
+                    <span className="font-mono text-xs text-muted-foreground">{s.subject || 'all subjects'}</span>
+                    <StatusBadge status={STATUS[s.status] || 'neutral'}>{s.status}</StatusBadge>
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-muted-foreground">
+                    {s.status !== 'done' && s.nextRun && <>Next run {timeAgo(s.nextRun)} ({formatDateTime(s.nextRun)})</>}
+                    {s.lastRun && <> · last run {timeAgo(s.lastRun)}{s.lastPurged != null ? `, ${formatNumber(s.lastPurged)} purged` : ''}</>}
+                  </div>
+                  {s.error && <div className="mt-1 text-[11px] text-nats-error">{s.error}</div>}
+                </div>
+                {s.status !== 'done' && (
+                  <button type="button" onClick={() => handleDelete(s.id)} className="rounded p-1 text-muted-foreground hover:text-nats-error" title="Cancel schedule"><XIcon size={13} /></button>
+                )}
+              </li>
+            ))}
+          </ul>
         )}
       </div>
     </div>

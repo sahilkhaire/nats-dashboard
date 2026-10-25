@@ -1,292 +1,247 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import { AlertCircle, CheckCircle2, Clock, Plus, Send, X as XIcon } from 'lucide-react'
 import { useStreamMutation } from '../../../../hooks/useStreamMutation'
-import { useTableSort } from '../../../../hooks/useTableSort'
-import { SortableTh } from '../../../../components/ui'
-import { Plus, Send, Clock, AlertCircle, X as XIcon } from 'lucide-react'
+import { useConfig } from '../../../../context/ConfigContext'
 import { useConfirmDialog } from '../../../../components/shared/ConfirmDialogProvider'
+import { Button } from '../../../../components/ui/button'
+import { Input } from '../../../../components/ui/input'
+import { StatusBadge } from '../../../../components/ui/StatusBadge'
+import { toDateTimeLocal, formatDateTime, timeAgo } from '../../../../utils/duration'
 
 const DELAY_OPTIONS = [
-  { label: 'Now (immediate)',   value: 0 },
-  { label: 'After 1 minute',   value: 60000 },
-  { label: 'After 5 minutes',  value: 300000 },
-  { label: 'After 15 minutes', value: 900000 },
-  { label: 'After 30 minutes', value: 1800000 },
-  { label: 'After 1 hour',     value: 3600000 },
-  { label: 'After 6 hours',    value: 21600000 },
-  { label: 'After 12 hours',   value: 43200000 },
-  { label: 'After 24 hours',   value: 86400000 },
-  { label: 'At specific time', value: -1 },
+  { label: 'Immediately', value: 0 },
+  { label: 'In 1 minute', value: 60_000 },
+  { label: 'In 5 minutes', value: 300_000 },
+  { label: 'In 15 minutes', value: 900_000 },
+  { label: 'In 1 hour', value: 3_600_000 },
+  { label: 'In 6 hours', value: 21_600_000 },
+  { label: 'In 24 hours', value: 86_400_000 },
+  { label: 'At a specific time…', value: -1 },
 ]
 
-function HeaderRow({ hdr, onChange, onRemove }) {
-  return (
-    <div className="flex gap-2 items-center">
-      <input value={hdr.key} onChange={e => onChange({ ...hdr, key: e.target.value })} placeholder="Header name"
-        className="input-enterprise flex-1 px-2 py-1 text-xs font-mono" />
-      <input value={hdr.value} onChange={e => onChange({ ...hdr, value: e.target.value })} placeholder="Value"
-        className="input-enterprise flex-1 px-2 py-1 text-xs font-mono" />
-      <button onClick={onRemove} className="rounded p-1 text-muted-foreground hover:bg-nats-error/20 hover:text-nats-error" title="Remove">
-        <XIcon size={13} />
-      </button>
-    </div>
-  )
+/** Stream subjects are often wildcards (orders.>) which cannot be published to directly. */
+const concrete = (s) => (s || '').replace(/\.>$/, '.test').replace(/(^|\.)\*(?=\.|$)/g, '$1test').replace(/^>$/, 'test')
+
+/** Does `subject` match a NATS subject pattern with * and > wildcards? */
+function matchesPattern(subject, pattern) {
+  const s = subject.split('.')
+  const p = pattern.split('.')
+  for (let i = 0; i < p.length; i += 1) {
+    if (p[i] === '>') return s.length > i
+    if (i >= s.length) return false
+    if (p[i] !== '*' && p[i] !== s[i]) return false
+  }
+  return s.length === p.length
 }
+
+const STATUS = { pending: 'neutral', running: 'warn', delivered: 'ok', error: 'error' }
 
 export function PublishTab({ stream }) {
   const { confirm } = useConfirmDialog()
+  const { pollInterval } = useConfig()
   const { publishMessage, listScheduledPublishes, cancelScheduledPublish } = useStreamMutation()
-  const subjects    = stream.config?.subjects ?? []
+  const subjects = stream.config?.subjects ?? []
   const allowMsgTtl = stream.config?.allow_msg_ttl === true
+  const blocked = stream.config?.sealed ? 'This stream is sealed and rejects new messages.' : stream.config?.mirror ? 'Mirrors only receive messages from their origin stream.' : null
 
-  const [subject,        setSubject]        = useState(subjects[0] ?? '')
-  const [payload,        setPayload]        = useState('')
-  const [hdrs,           setHdrs]           = useState([])
-  const [msgTtl,         setMsgTtl]         = useState('')
-  const [delayOption,    setDelayOption]    = useState(0)
-  const [scheduleAt,     setScheduleAt]     = useState('')
-  const [publishing,     setPublishing]     = useState(false)
-  const [publishResult,  setPublishResult]  = useState(null)
-  const [publishError,   setPublishError]   = useState('')
-  const [pending,        setPending]        = useState([])
-  const [loadingPending, setLoadingPending] = useState(true)
-
-  useEffect(() => {
-    const d = new Date(Date.now() + 3600000); d.setSeconds(0, 0)
-    setScheduleAt(d.toISOString().slice(0, 16))
-  }, [])
+  const [subject, setSubject] = useState(concrete(subjects[0]))
+  const [payload, setPayload] = useState('')
+  const [hdrs, setHdrs] = useState([])
+  const [msgId, setMsgId] = useState('')
+  const [msgTtl, setMsgTtl] = useState('')
+  const [delay, setDelay] = useState(0)
+  const [scheduleAt, setScheduleAt] = useState(() => toDateTimeLocal(new Date(Date.now() + 3_600_000)))
+  const [publishing, setPublishing] = useState(false)
+  const [result, setResult] = useState(null)
+  const [error, setError] = useState('')
+  const [pending, setPending] = useState([])
 
   const reloadPending = useCallback(async () => {
-    setLoadingPending(true)
-    try {
-      const list = await listScheduledPublishes(stream.name)
-      setPending(list)
-    } catch { /* ignore */ }
-    finally { setLoadingPending(false) }
+    try { setPending(await listScheduledPublishes(stream.name)) } catch { /* ignore */ }
   }, [listScheduledPublishes, stream.name])
 
-  useEffect(() => { reloadPending() }, [reloadPending])
+  useEffect(() => {
+    reloadPending()
+    const t = setInterval(reloadPending, Math.max(3000, pollInterval * 2))
+    return () => clearInterval(t)
+  }, [reloadPending, pollInterval])
 
-  const handlePublish = async () => {
-    setPublishError(''); setPublishResult(null)
-    if (!subject.trim()) { setPublishError('Subject is required'); return }
+  const subjectOk = subject.trim() && !/[\s*>]/.test(subject.trim())
+  const inStream = !subjects.length || subjects.some((p) => matchesPattern(subject.trim(), p))
+  let jsonState = null
+  if (payload.trim().startsWith('{') || payload.trim().startsWith('[')) {
+    try { JSON.parse(payload); jsonState = 'valid' } catch { jsonState = 'invalid' }
+  }
 
-    let resolvedScheduleAt
-    if (delayOption === -1) {
-      if (!scheduleAt) { setPublishError('Please pick a delivery time'); return }
-      resolvedScheduleAt = new Date(scheduleAt).toISOString()
-      if (new Date(resolvedScheduleAt) <= new Date()) { setPublishError('Scheduled time must be in the future'); return }
-    } else if (delayOption > 0) {
-      resolvedScheduleAt = new Date(Date.now() + delayOption).toISOString()
+  const handlePublish = async (e) => {
+    e?.preventDefault()
+    setError('')
+    setResult(null)
+    if (!subjectOk) { setError('Enter a concrete subject (no spaces or wildcards).'); return }
+    let at
+    if (delay === -1) {
+      const ts = new Date(scheduleAt)
+      if (!Number.isFinite(ts.getTime()) || ts <= new Date()) { setError('Pick a delivery time in the future.'); return }
+      at = ts.toISOString()
+    } else if (delay > 0) {
+      at = new Date(Date.now() + delay).toISOString()
     }
-
     setPublishing(true)
     try {
-      const result = await publishMessage({
+      const res = await publishMessage({
         stream: stream.name,
         subject: subject.trim(),
         payload,
-        headers: hdrs.filter(h => h.key.trim()),
+        headers: hdrs.filter((h) => h.key.trim()),
+        msgId: msgId.trim() || undefined,
         msgTtl: allowMsgTtl && msgTtl.trim() ? msgTtl.trim() : undefined,
-        scheduleAt: resolvedScheduleAt,
+        scheduleAt: at,
       })
-      setPublishResult(result)
-      if (resolvedScheduleAt) reloadPending()
+      setResult(res)
+      if (at) reloadPending()
     } catch (err) {
-      setPublishError(err.message)
+      setError(err.message)
     } finally {
       setPublishing(false)
     }
   }
 
-  const handleCancelPending = async (id) => {
-    const shouldCancel = await confirm(
-      'Cancel scheduled message?',
-      'The message will be removed from the pending queue and will not be delivered.'
-    )
-    if (!shouldCancel) return
-    try { await cancelScheduledPublish(id); reloadPending() }
-    catch (err) { setPublishError(err.message) }
+  const cancel = async (id) => {
+    if (!(await confirm('Cancel scheduled message?', 'It will not be delivered.', { confirmLabel: 'Cancel message' }))) return
+    try { await cancelScheduledPublish(id); reloadPending() } catch (err) { setError(err.message) }
   }
 
-  const isScheduled = delayOption !== 0
-
-  const { sortedData: sortedPending, sortBy, sortDir, handleSort } = useTableSort(pending, {
-    defaultSortBy: 'scheduleAt',
-    getSortValue: (p, key) => {
-      if (key === 'subject') return p.subject ?? ''
-      if (key === 'payload') return p.payload ?? ''
-      if (key === 'scheduleAt') return p.scheduleAt ? new Date(p.scheduleAt).getTime() : 0
-      if (key === 'status') return p.status ?? ''
-      return ''
-    },
-  })
-
   return (
-    <div className="space-y-5">
-      <div className="overflow-hidden rounded-lg border border-border bg-card">
-        <div className="flex items-center gap-2 border-b border-border bg-card px-4 py-3">
-          <Send size={13} className="text-nats-accent" />
-          <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Compose Message</span>
-        </div>
-        <div className="p-4 space-y-4">
-          {/* Subject */}
+    <div className="grid gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+      <form className="surface-card overflow-hidden" onSubmit={handlePublish}>
+        <div className="card-header"><Send size={13} className="text-primary" /><span className="card-title">Compose message</span></div>
+        <div className="space-y-4 p-4">
+          {blocked && <div className="rounded-md border border-nats-warn/40 bg-nats-warn/10 px-3 py-2 text-sm text-nats-warn">{blocked}</div>}
           <div>
-            <label className="mb-1 block text-xs text-muted-foreground">Subject <span className="text-nats-error">*</span></label>
-            {subjects.length > 0 ? (
-              <div className="flex gap-2">
-                <select
-                  value={subjects.includes(subject) ? subject : '__custom__'}
-                  onChange={e => { if (e.target.value !== '__custom__') setSubject(e.target.value) }}
-                  className="input-enterprise w-48 shrink-0"
-                >
-                  {subjects.map(s => <option key={s} value={s}>{s}</option>)}
-                  <option value="__custom__">Custom…</option>
+            <label className="field-label">Subject *</label>
+            <div className="flex gap-2">
+              {subjects.length > 0 && (
+                <select className="input-enterprise w-44 shrink-0 font-mono" value={subjects.find((s) => concrete(s) === subject) ?? ''}
+                  onChange={(e) => e.target.value && setSubject(concrete(e.target.value))} aria-label="Stream subject patterns">
+                  <option value="">pattern…</option>
+                  {subjects.map((s) => <option key={s} value={s}>{s}</option>)}
                 </select>
-                <input value={subject} onChange={e => setSubject(e.target.value)} placeholder="e.g. orders.created"
-                  className="input-enterprise flex-1 font-mono" />
-              </div>
-            ) : (
-              <input value={subject} onChange={e => setSubject(e.target.value)} placeholder="e.g. orders.created"
-                className="input-enterprise w-full font-mono" />
-            )}
-          </div>
-
-          {/* Payload */}
-          <div>
-            <label className="mb-1 block text-xs text-muted-foreground">Payload <span className="text-muted-foreground">(text or JSON)</span></label>
-            <textarea value={payload} onChange={e => setPayload(e.target.value)} rows={5}
-              placeholder={'{"event":"order.created","orderId":"123"}'}
-              className="input-enterprise w-full resize-y px-2 py-1.5 font-mono" />
-            <div className="flex gap-2 mt-1">
-              <button onClick={() => { try { setPayload(JSON.stringify(JSON.parse(payload), null, 2)) } catch { /* not JSON */ } }} className="text-xs text-muted-foreground hover:text-primary">Format JSON</button>
-              <button onClick={() => setPayload('')} className="text-xs text-muted-foreground hover:text-nats-error">Clear</button>
+              )}
+              <Input value={subject} onChange={(e) => setSubject(e.target.value)} placeholder="orders.created" className="font-mono" />
             </div>
+            {subject.trim() && !subjectOk && <p className="field-hint text-nats-error">Subjects cannot contain spaces or wildcards.</p>}
+            {subjectOk && !inStream && <p className="field-hint text-nats-warn">Not covered by this stream&apos;s subjects ({subjects.join(', ')}) — the publish will be rejected.</p>}
           </div>
 
-          {/* Headers */}
           <div>
-            <div className="flex items-center justify-between mb-1">
-              <label className="text-xs text-muted-foreground">NATS Headers <span className="text-muted-foreground">(optional)</span></label>
-              <button onClick={() => setHdrs(h => [...h, { key: '', value: '' }])} className="flex items-center gap-1 text-xs text-muted-foreground hover:text-primary">
+            <div className="mb-1.5 flex items-center justify-between">
+              <label className="field-label mb-0">Payload</label>
+              <div className="flex items-center gap-3 text-xs">
+                {jsonState && <span className={jsonState === 'valid' ? 'text-nats-ok' : 'text-nats-error'}>{jsonState === 'valid' ? 'valid JSON' : 'invalid JSON'}</span>}
+                <button type="button" className="text-muted-foreground hover:text-primary" disabled={jsonState !== 'valid'}
+                  onClick={() => setPayload(JSON.stringify(JSON.parse(payload), null, 2))}>Format</button>
+                <button type="button" className="text-muted-foreground hover:text-foreground" onClick={() => setPayload('')}>Clear</button>
+              </div>
+            </div>
+            <textarea value={payload} onChange={(e) => setPayload(e.target.value)} rows={7} placeholder={'{"orderId": "123"}'}
+              className="input-enterprise resize-y font-mono text-xs" />
+            <p className="field-hint">{new TextEncoder().encode(payload).length.toLocaleString()} bytes</p>
+          </div>
+
+          <div>
+            <div className="mb-1.5 flex items-center justify-between">
+              <label className="field-label mb-0">Headers</label>
+              <button type="button" onClick={() => setHdrs((h) => [...h, { key: '', value: '' }])} className="flex items-center gap-1 text-xs text-muted-foreground hover:text-primary">
                 <Plus size={11} /> Add header
               </button>
             </div>
-            {hdrs.length > 0 && (
-              <div className="space-y-2">
-                {hdrs.map((h, i) => (
-                  <HeaderRow key={i} hdr={h}
-                    onChange={updated => setHdrs(prev => prev.map((x, j) => j === i ? updated : x))}
-                    onRemove={() => setHdrs(prev => prev.filter((_, j) => j !== i))}
-                  />
-                ))}
+            <div className="space-y-2">
+              {hdrs.map((h, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  <Input value={h.key} onChange={(e) => setHdrs((p) => p.map((x, j) => (j === i ? { ...x, key: e.target.value } : x)))} placeholder="Name" className="h-8 font-mono text-xs" />
+                  <Input value={h.value} onChange={(e) => setHdrs((p) => p.map((x, j) => (j === i ? { ...x, value: e.target.value } : x)))} placeholder="Value" className="h-8 font-mono text-xs" />
+                  <button type="button" onClick={() => setHdrs((p) => p.filter((_, j) => j !== i))} className="rounded p-1 text-muted-foreground hover:text-nats-error" aria-label="Remove header"><XIcon size={13} /></button>
+                </div>
+              ))}
+              {!hdrs.length && <p className="text-xs text-muted-foreground">No custom headers.</p>}
+            </div>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div>
+              <label className="field-label">Message ID <span className="font-normal">(deduplication)</span></label>
+              <Input value={msgId} onChange={(e) => setMsgId(e.target.value)} placeholder="optional Nats-Msg-Id" className="font-mono text-xs" />
+            </div>
+            {allowMsgTtl && (
+              <div>
+                <label className="field-label">Message TTL</label>
+                <Input value={msgTtl} onChange={(e) => setMsgTtl(e.target.value)} placeholder="e.g. 1h (Nats-TTL)" className="font-mono text-xs" />
+              </div>
+            )}
+            <div>
+              <label className="field-label">Delivery</label>
+              <select className="input-enterprise" value={delay} onChange={(e) => setDelay(Number(e.target.value))}>
+                {DELAY_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+              </select>
+            </div>
+            {delay === -1 && (
+              <div>
+                <label className="field-label">Deliver at</label>
+                <Input type="datetime-local" value={scheduleAt} onChange={(e) => setScheduleAt(e.target.value)} />
               </div>
             )}
           </div>
+          {delay !== 0 && <p className="flex items-center gap-1.5 text-xs text-muted-foreground"><Clock size={12} /> Held by the dashboard server until delivery; lost if the dashboard restarts.</p>}
 
-          {allowMsgTtl && (
-            <div>
-              <label className="mb-1 block text-xs text-muted-foreground">Message TTL <span className="text-muted-foreground">(Nats-Msg-Ttl header, e.g. 1h, 30m)</span></label>
-              <input value={msgTtl} onChange={e => setMsgTtl(e.target.value)} placeholder="e.g. 1h — message expires after this duration"
-                className="input-enterprise w-full font-mono" />
-            </div>
-          )}
-
-          <div>
-            <label className="mb-1 block text-xs text-muted-foreground">Delivery</label>
-            <div className="flex gap-2 flex-wrap items-center">
-              <select value={delayOption} onChange={e => setDelayOption(Number(e.target.value))}
-                className="input-enterprise px-2 py-1.5 text-sm">
-                {DELAY_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-              </select>
-              {delayOption === -1 && (
-                <input type="datetime-local" value={scheduleAt} onChange={e => setScheduleAt(e.target.value)}
-                  className="input-enterprise px-2 py-1.5 text-sm" />
-              )}
-              {isScheduled && (
-                <span className="flex items-center gap-1 text-xs text-nats-warn">
-                  <Clock size={11} /> Scheduled — held server-side until delivery time
-                </span>
-              )}
-            </div>
-          </div>
-
-          {publishError && (
-            <div className="flex items-start gap-2 p-2 rounded bg-nats-error/10 border border-nats-error/30 text-nats-error text-xs">
-              <AlertCircle size={13} className="shrink-0 mt-0.5" /> {publishError}
-            </div>
-          )}
-          {publishResult && !publishError && (
-            <div className="p-2 rounded bg-nats-ok/10 border border-nats-ok/30 text-nats-ok text-xs font-mono">
-              {publishResult.scheduled
-                ? `Scheduled for ${new Date(publishResult.scheduleAt).toLocaleString()} (id: ${publishResult.id})`
-                : `Delivered → stream: ${publishResult.stream}, seq: ${publishResult.seq}${publishResult.duplicate ? ' (duplicate)' : ''}`}
+          {error && <div className="flex items-start gap-2 rounded-md border border-nats-error/40 bg-nats-error/10 px-3 py-2 text-xs text-nats-error"><AlertCircle size={13} className="mt-0.5 shrink-0" />{error}</div>}
+          {result && !error && (
+            <div className="flex items-start gap-2 rounded-md border border-nats-ok/40 bg-nats-ok/10 px-3 py-2 text-xs text-nats-ok">
+              <CheckCircle2 size={13} className="mt-0.5 shrink-0" />
+              {result.scheduled
+                ? `Scheduled for ${formatDateTime(result.scheduleAt)}`
+                : `Stored in ${result.stream} at sequence ${result.seq}${result.duplicate ? ' (duplicate — already stored)' : ''}`}
             </div>
           )}
 
           <div className="flex justify-end">
-            <button onClick={handlePublish} disabled={publishing}
-              className="flex items-center gap-1.5 px-4 py-1.5 rounded bg-nats-accent text-nats-bg text-sm font-semibold hover:opacity-90 disabled:opacity-50 transition-opacity">
-              <Send size={13} />
-              {publishing ? 'Sending…' : isScheduled ? 'Schedule Message' : 'Publish Now'}
-            </button>
+            <Button type="submit" disabled={publishing || Boolean(blocked) || !subjectOk}>
+              <Send size={14} /> {publishing ? 'Sending…' : delay !== 0 ? 'Schedule message' : 'Publish'}
+            </Button>
           </div>
         </div>
-      </div>
+      </form>
 
-      {(pending.length > 0 || !loadingPending) && (
-        <div className="overflow-hidden rounded-lg border border-border bg-card">
-          <div className="flex items-center gap-2 border-b border-border bg-card px-4 py-3">
-            <Clock size={13} className="text-muted-foreground" />
-            <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Scheduled Messages</span>
-            <span className="text-xs text-muted-foreground">({pending.length})</span>
-          </div>
-          {loadingPending ? (
-            <div className="p-4 text-sm text-muted-foreground">Loading…</div>
-          ) : pending.length === 0 ? (
-            <div className="p-6 text-center text-sm text-muted-foreground">No pending scheduled messages.</div>
-          ) : (
-            <table className="w-full text-sm">
-              <thead className="border-b border-border bg-card/60">
-                <tr>
-                  <SortableTh sortKey="subject" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Subject</SortableTh>
-                  <SortableTh sortKey="payload" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Payload preview</SortableTh>
-                  <SortableTh sortKey="scheduleAt" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Deliver at</SortableTh>
-                  <SortableTh sortKey="status" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Status</SortableTh>
-                  <th className="w-12 p-3 text-left"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {sortedPending.map(p => (
-                  <tr key={p.id} className="border-b border-border hover:bg-muted/30">
-                    <td className="p-3 font-mono text-xs text-nats-accent">{p.subject}</td>
-                    <td className="max-w-[180px] truncate p-3 font-mono text-xs text-muted-foreground">
-                      {p.payload ? p.payload.slice(0, 60) + (p.payload.length > 60 ? '…' : '') : <span className="text-muted-foreground">(empty)</span>}
-                    </td>
-                    <td className="p-3 text-xs">{p.scheduleAt ? new Date(p.scheduleAt).toLocaleString() : '—'}</td>
-                    <td className="p-3">
-                      <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
-                        p.status === 'delivered' ? 'bg-nats-ok/20 text-nats-ok' :
-                        p.status === 'error'     ? 'bg-nats-error/20 text-nats-error' :
-                        p.status === 'running'   ? 'bg-nats-warn/20 text-nats-warn' :
-                        'bg-border text-foreground'
-                      }`}>{p.status}</span>
-                      {p.error  && <div className="text-xs text-nats-error mt-0.5">{p.error}</div>}
-                      {p.result && <div className="mt-0.5 text-xs text-muted-foreground">seq: {p.result.seq}</div>}
-                    </td>
-                    <td className="p-3">
-                      {(p.status === 'pending' || p.status === 'running') && (
-                        <button onClick={() => handleCancelPending(p.id)} className="rounded p-1 text-muted-foreground transition-colors hover:bg-nats-error/20 hover:text-nats-error" title="Cancel">
-                          <XIcon size={13} />
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
+      <div className="surface-card h-fit overflow-hidden">
+        <div className="card-header justify-between">
+          <span className="flex items-center gap-2"><Clock size={13} className="text-muted-foreground" /><span className="card-title">Scheduled messages</span></span>
+          <span className="text-[11px] text-muted-foreground">{pending.length}</span>
         </div>
-      )}
+        {pending.length === 0 ? (
+          <div className="p-6 text-center text-sm text-muted-foreground">Nothing scheduled.</div>
+        ) : (
+          <ul className="divide-y divide-border">
+            {[...pending].sort((a, b) => new Date(b.scheduleAt) - new Date(a.scheduleAt)).map((p) => (
+              <li key={p.id} className="flex items-start gap-3 px-4 py-3">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate font-mono text-xs">{p.subject}</span>
+                    <StatusBadge status={STATUS[p.status] || 'neutral'}>{p.status}</StatusBadge>
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-muted-foreground" title={formatDateTime(p.scheduleAt)}>
+                    {p.status === 'pending' ? `delivers ${timeAgo(p.scheduleAt)}` : formatDateTime(p.scheduleAt)}
+                    {p.result?.seq ? ` · seq ${p.result.seq}` : ''}
+                  </div>
+                  {p.payload && <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground">{p.payload.slice(0, 120)}</div>}
+                  {p.error && <div className="mt-1 text-[11px] text-nats-error">{p.error}</div>}
+                </div>
+                {p.status === 'pending' && (
+                  <button type="button" onClick={() => cancel(p.id)} className="rounded p-1 text-muted-foreground hover:text-nats-error" title="Cancel"><XIcon size={13} /></button>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
     </div>
   )
 }

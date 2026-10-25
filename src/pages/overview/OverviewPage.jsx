@@ -1,466 +1,283 @@
-import { useState, useEffect, useRef } from 'react'
 import { Link } from 'react-router-dom'
-import { useConfig }       from '../../context/ConfigContext'
-import { useNotifications } from '../../context/NotificationContext'
-import { useNatsPolling }  from '../../hooks/useNatsPolling'
-import { MetricCard }      from '../../components/MetricCard'
-import { GaugeBar }        from '../../components/GaugeBar'
-import { ConnectionError } from '../../components/ConnectionError'
-import { formatBytes }     from '../../utils/byteFormatter'
 import {
-  LineChart, AreaChart, Line, Area,
-  XAxis, YAxis, Tooltip, ResponsiveContainer,
-} from 'recharts'
-import {
-  Shield, ShieldOff, Lock, Unlock, Server, Cpu, MemoryStick,
-  Network, AlertTriangle, Activity, Database, Info,
-  ArrowDownToLine, ArrowUpFromLine, MessageSquare, HardDrive,
+  Activity, AlertTriangle, ArrowDownToLine, ArrowUpFromLine, Cpu, Database, Info, Lock, MemoryStick, Network,
+  Radio, Server, Shield, ShieldOff, Unlock, Waves,
 } from 'lucide-react'
+import { useNatsPolling } from '../../hooks/useNatsPolling'
+import { useConfig } from '../../context/ConfigContext'
+import { MetricCard } from '../../components/ui/MetricCard'
+import { GaugeBar } from '../../components/ui/GaugeBar'
+import { StatusBadge } from '../../components/ui/StatusBadge'
+import { AlertBanner } from '../../components/ui/AlertBanner'
+import { PageHeader } from '../../components/shared/PageHeader'
+import { PollState } from '../../components/shared/PageState'
+import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart'
+import { formatBytes, formatBytesRate, formatCompact, formatNumber, formatRate } from '../../utils/byteFormatter'
+import { formatDateTime } from '../../utils/duration'
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+const MAX_HISTORY = 90
 
-function StatBox({ label, value, subValue, icon: Icon, variant = 'default', to }) {
-  const colors = {
-    default: 'border-border',
-    error:   'border-nats-error/50 bg-nats-error/10',
-    warn:    'border-nats-warn/50 bg-nats-warn/10',
-    ok:      'border-nats-ok/40 bg-nats-ok/10',
+/** Rolling throughput history derived from successive /varz counters, keyed by fetch time. */
+const throughputStores = new Map()
+
+function useThroughputHistory(varz, lastFetch, cacheKey) {
+  const ref = {
+    get current() { return throughputStores.get(cacheKey) ?? { processedAt: null, prev: null, history: [] } },
+    set current(v) { throughputStores.set(cacheKey, v) },
   }
-  const inner = (
-    <div className={`rounded-lg border bg-card p-4 ${colors[variant]} ${to ? 'cursor-pointer transition-colors hover:border-primary/50' : ''}`}>
-      <div className="flex items-center justify-between mb-2">
-        <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{label}</div>
-        {Icon && <Icon size={14} className="text-muted-foreground" />}
-      </div>
-      <div className={`font-mono text-2xl font-semibold tabular-nums ${
-        variant === 'error' ? 'text-nats-error' : variant === 'warn' ? 'text-nats-warn' : variant === 'ok' ? 'text-nats-ok' : 'text-foreground'
-      }`}>
-        {value ?? <span className="text-base text-muted-foreground">—</span>}
-      </div>
-      {subValue && <div className="mt-1 text-xs text-muted-foreground">{subValue}</div>}
-    </div>
-  )
-  return to ? <Link to={to}>{inner}</Link> : inner
+  const st = ref.current
+  if (!varz || lastFetch == null || (st.processedAt != null && lastFetch <= st.processedAt) || varz.in_msgs == null) return st.history
+
+  const prev = st.prev
+  let history = st.history
+  if (prev) {
+    const dt = (lastFetch - prev.at) / 1000
+    if (dt > 0) {
+      const rate = (cur, old) => Math.max(0, (cur - old) / dt)
+      history = [...history, {
+        ts: lastFetch,
+        inMsgs: rate(varz.in_msgs, prev.in_msgs),
+        outMsgs: rate(varz.out_msgs, prev.out_msgs),
+        inBytes: rate(varz.in_bytes, prev.in_bytes),
+        outBytes: rate(varz.out_bytes, prev.out_bytes),
+      }].slice(-MAX_HISTORY)
+    }
+  }
+  ref.current = {
+    processedAt: lastFetch,
+    prev: { at: lastFetch, in_msgs: varz.in_msgs, out_msgs: varz.out_msgs, in_bytes: varz.in_bytes, out_bytes: varz.out_bytes },
+    history,
+  }
+  return history
 }
 
-function MiniChart({ data, dataKey, color, label, unit = '' }) {
+function ChartCard({ title, value, children }) {
   return (
-    <div className="rounded-lg border border-border bg-card p-4">
-      <div className="flex items-center gap-2 mb-3">
-        <span className="text-sm font-medium text-foreground">{label}</span>
-        {data.length > 0 && (
-          <span className="ml-auto text-xs font-mono text-muted-foreground">
-            {(data[data.length - 1]?.[dataKey] ?? 0).toLocaleString()}{unit}
-          </span>
-        )}
+    <div className="surface-card p-4">
+      <div className="mb-3 flex items-baseline justify-between gap-3">
+        <span className="text-sm font-medium">{title}</span>
+        <span className="font-mono text-sm tabular text-foreground">{value}</span>
       </div>
-      <div className="h-36">
-        <ResponsiveContainer width="100%" height="100%">
-          <AreaChart data={data} margin={{ top: 4, right: 0, bottom: 0, left: 0 }}>
-            <defs>
-              <linearGradient id={`grad-${dataKey}`} x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%"  stopColor={color} stopOpacity={0.3} />
-                <stop offset="95%" stopColor={color} stopOpacity={0} />
-              </linearGradient>
-            </defs>
-            <XAxis dataKey="time" hide />
-            <YAxis hide domain={[0, 'auto']} />
-            <Tooltip
-              contentStyle={{ background: 'rgb(var(--card))', border: '1px solid rgb(var(--border))', borderRadius: 6, fontSize: 11 }}
-              labelStyle={{ display: 'none' }}
-              formatter={v => [`${v.toLocaleString()}${unit}`, label]}
-            />
-            <Area type="monotone" dataKey={dataKey} stroke={color} fill={`url(#grad-${dataKey})`} dot={false} strokeWidth={2} isAnimationActive={false} />
-          </AreaChart>
-        </ResponsiveContainer>
-      </div>
+      {children}
     </div>
   )
 }
 
 function InfoRow({ label, children, mono = false }) {
   return (
-    <div className="flex items-start justify-between border-b border-border py-2.5 last:border-0">
-      <span className="w-36 shrink-0 text-xs text-muted-foreground">{label}</span>
-      <span className={`text-right text-xs text-foreground ${mono ? 'font-mono' : ''}`}>{children ?? '—'}</span>
+    <div className="flex items-start justify-between gap-4 border-b border-border py-2.5 last:border-0">
+      <span className="shrink-0 text-xs text-muted-foreground">{label}</span>
+      <span className={`min-w-0 break-all text-right text-xs text-foreground ${mono ? 'font-mono' : ''}`}>{children ?? '—'}</span>
     </div>
   )
 }
 
-function Badge({ children, color = 'gray', icon: Icon }) {
-  const colors = {
-    green: 'bg-nats-ok/20 text-nats-ok border-nats-ok/30',
-    red:   'bg-nats-error/20 text-nats-error border-nats-error/30',
-    gray:  'border-transparent bg-border text-foreground',
-    warn:  'bg-nats-warn/20 text-nats-warn border-nats-warn/30',
-    blue:  'bg-blue-500/20 text-blue-300 border-blue-500/30',
-  }
-  return (
-    <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border text-xs font-medium ${colors[color]}`}>
-      {Icon && <Icon size={10} />}
-      {children}
-    </span>
-  )
-}
+export function OverviewPage() {
+  const { data: varz, error, lastFetch, refetch } = useNatsPolling('/varz')
+  const { data: jsz } = useNatsPolling('/jsz')
+  const { data: health, error: healthError } = useNatsPolling('/healthz')
+  const { connection } = useConfig()
+  const history = useThroughputHistory(varz, lastFetch, connection?.id)
 
-// ─── Page ─────────────────────────────────────────────────────────────────────
-
-export function OverviewPage({ onData }) {
-  const { pollInterval } = useConfig()
-  const { pushNotification } = useNotifications()
-  const { data: varz, error, lastFetch } = useNatsPolling('/varz', pollInterval)
-  const { data: jsz }  = useNatsPolling('/jsz', 3000)
-  const { data: healthData } = useNatsPolling('/healthz', 2000)
-
-  const [history, setHistory] = useState([])
-  const prevRef = useRef(null)
-  const lastWarningsRef = useRef({ viaProtocol: false, slowConsumers: 0, apiErrors: 0 })
-  const MAX_HISTORY = 60
-
-  useEffect(() => {
-    if (!varz) return
-    const prev    = prevRef.current
-    const elapsed = prev ? (Date.now() - prev.time) / 1000 : pollInterval / 1000
-
-    const safeRate = (cur, prevVal) =>
-      (cur != null && prevVal != null) ? Math.max(0, Math.round((cur - prevVal) / elapsed)) : null
-
-    const inMsgRate  = safeRate(varz.in_msgs,   prev?.inMsgs)
-    const outMsgRate = safeRate(varz.out_msgs,  prev?.outMsgs)
-    const inByteRate = safeRate(varz.in_bytes,  prev?.inBytes)
-    const outByteRate = safeRate(varz.out_bytes, prev?.outBytes)
-
-    prevRef.current = {
-      inMsgs:   varz.in_msgs,
-      outMsgs:  varz.out_msgs,
-      inBytes:  varz.in_bytes,
-      outBytes: varz.out_bytes,
-      time:     Date.now(),
-    }
-
-    const point = {
-      time:        Date.now(),
-      inMsgRate:   inMsgRate  ?? 0,
-      outMsgRate:  outMsgRate ?? 0,
-      inByteRate:  inByteRate  ?? 0,
-      outByteRate: outByteRate ?? 0,
-    }
-    setHistory(prev => [...prev.slice(-(MAX_HISTORY - 1)), point])
-  }, [varz, pollInterval])
-
-  useEffect(() => { onData?.({ varz, lastFetch }) }, [varz, lastFetch, onData])
-
-  const viaProtocol   = varz?._via === 'nats_protocol'
+  const viaProtocol = varz?._via === 'nats_protocol'
+  const latest = history[history.length - 1]
   const slowConsumers = varz?.slow_consumers ?? 0
-  const apiErrors     = jsz?.api?.errors ?? 0
-  const jsMem         = jsz?.memory     ?? 0
-  const jsMemMax      = jsz?.config?.max_memory ?? 0
-  const jsStore       = jsz?.storage    ?? 0
-  const jsStoreMax    = jsz?.config?.max_storage ?? 0
-  const healthy       = !error && healthData?.status === 'ok'
-
-  const totalMsgsIn  = varz?.in_msgs   != null ? varz.in_msgs.toLocaleString()  : null
-  const totalMsgsOut = varz?.out_msgs  != null ? varz.out_msgs.toLocaleString()  : null
-  const totalBytesIn = varz?.in_bytes  != null ? formatBytes(varz.in_bytes)      : null
-  const totalBytesOut= varz?.out_bytes != null ? formatBytes(varz.out_bytes)     : null
-
-  useEffect(() => {
-    if (!varz) return
-    const prev = lastWarningsRef.current
-    if (viaProtocol && !prev.viaProtocol) {
-      pushNotification({
-        level: 'warning',
-        title: 'Limited monitoring mode',
-        message: 'Connected via NATS protocol (4222). Some metrics require monitoring port 8222.',
-        source: 'overview',
-      })
-    }
-    if (slowConsumers > 0 && slowConsumers !== prev.slowConsumers) {
-      pushNotification({
-        level: 'error',
-        title: `${slowConsumers} Slow Consumer${slowConsumers > 1 ? 's' : ''} Detected`,
-        message: 'Client(s) cannot consume fast enough. Check Connections for pending_bytes.',
-        source: 'overview',
-      })
-    }
-    if (apiErrors > 0 && apiErrors !== prev.apiErrors) {
-      pushNotification({
-        level: 'warning',
-        title: `${apiErrors} JetStream API Error${apiErrors > 1 ? 's' : ''}`,
-        message: 'JetStream has logged API errors. Check stream and consumer configurations.',
-        source: 'overview',
-      })
-    }
-    lastWarningsRef.current = { viaProtocol, slowConsumers, apiErrors }
-  }, [apiErrors, pushNotification, slowConsumers, viaProtocol, varz])
-
-  if (error) return <ConnectionError error={error} />
-  if (!varz) return <div className="p-6 text-muted-foreground">Loading...</div>
+  const apiErrors = jsz?.api?.errors ?? 0
+  const healthy = !healthError && health?.status === 'ok'
+  const streams = jsz ? (jsz.total_streams ?? jsz.streams ?? 0) : null
+  const consumers = jsz ? (jsz.total_consumers ?? jsz.consumers ?? 0) : null
+  const isCluster = (varz?.routes ?? 0) > 0 || Boolean(varz?.cluster?.name)
 
   return (
-    <div className="space-y-6">
+    <div>
+      <PageHeader
+        title="Overview"
+        icon={Activity}
+        description={varz ? `${varz.server_name || 'NATS server'}${varz.version ? ` · v${varz.version}` : ''}${varz.uptime ? ` · up ${varz.uptime}` : ''}` : 'Server health and throughput'}
+        actions={varz && (
+          <StatusBadge status={healthy ? 'ok' : healthError ? 'error' : 'warn'} dot>
+            {healthy ? 'Healthy' : healthError ? 'Unreachable' : (health?.status || 'Checking')}
+          </StatusBadge>
+        )}
+      />
 
-      {/* Protocol-mode notice */}
-      {viaProtocol && (
-        <div className="flex items-start gap-3 p-3.5 rounded-lg border border-nats-warn/30 bg-nats-warn/10 text-xs text-nats-warn">
-          <Info size={14} className="shrink-0 mt-0.5" />
-          <div>
-            <span className="font-semibold">Connected via NATS protocol (port 4222).</span>{' '}
-            Real-time CPU, memory, connections, subscriptions and slow-consumer metrics require the HTTP monitoring port 8222
-            (<span className="font-mono">nats-server -m 8222</span>).
-            JetStream, stream and consumer data is fully available.
-          </div>
-        </div>
-      )}
-
-      {/* ── Row 1: Health cards ──────────────────────────────────────────────── */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <StatBox
-          label="Server Status"
-          icon={Activity}
-          value={healthy ? <span className="text-nats-ok">Healthy</span> : <span className="text-muted-foreground">Unknown</span>}
-          subValue={varz.uptime ?? 'uptime via HTTP only'}
-          variant={healthy ? 'default' : 'default'}
-        />
-        <StatBox
-          label="Version"
-          icon={Server}
-          value={<span className="text-lg">{varz.version ?? '—'}</span>}
-          subValue={varz.go ? `Go ${varz.go}` : undefined}
-        />
-        <StatBox
-          label="JetStream"
-          icon={Database}
-          value={jsz ? <span className="text-nats-ok">Enabled</span> : <span className="text-muted-foreground">—</span>}
-          subValue={jsz ? `${jsz.total_streams ?? jsz.streams ?? 0} streams · ${jsz.total_consumers ?? jsz.consumers ?? 0} consumers` : undefined}
-          to="/jetstream"
-        />
-        <StatBox
-          label="Connections"
-          icon={Network}
-          value={varz.connections ?? (viaProtocol ? '—' : '0')}
-          subValue={varz.max_connections ? `max ${varz.max_connections.toLocaleString()}` : undefined}
-          to="/connections"
-        />
-      </div>
-
-      {/* ── Row 2: Charts (msgs/sec + bytes/sec) ────────────────────────────── */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        <MiniChart data={history} dataKey="inMsgRate"   color="#00c8b4" label="Msgs/sec In"     unit=" msg/s" />
-        <MiniChart data={history} dataKey="outMsgRate"  color="#4d8ff5" label="Msgs/sec Out"    unit=" msg/s" />
-        <MiniChart data={history} dataKey="inByteRate"  color="#a78bfa" label="Bytes/sec In"    unit=" B/s" />
-        <MiniChart data={history} dataKey="outByteRate" color="#f59e0b" label="Bytes/sec Out"   unit=" B/s" />
-      </div>
-
-      {/* ── Row 3: Key counters ──────────────────────────────────────────────── */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
-        <StatBox label="Active Connections" value={varz.connections ?? '—'} icon={Network} to="/connections" />
-        <StatBox label="Subscriptions"      value={varz.subscriptions ?? '—'} icon={MessageSquare} to="/subscriptions" />
-        <StatBox
-          label="Slow Consumers"
-          value={varz.slow_consumers ?? '—'}
-          icon={AlertTriangle}
-          variant={slowConsumers > 0 ? 'error' : 'default'}
-          to="/connections"
-        />
-        <StatBox label="Streams"   value={jsz ? (jsz.total_streams   ?? jsz.streams   ?? 0) : '—'} icon={Database}      to="/streams" />
-        <StatBox label="Consumers" value={jsz ? (jsz.total_consumers ?? jsz.consumers ?? 0) : '—'} icon={MessageSquare} to="/streams" />
-        <StatBox
-          label="JS API Errors"
-          value={jsz?.api?.errors ?? '—'}
-          icon={AlertTriangle}
-          variant={apiErrors > 0 ? 'error' : 'default'}
-        />
-      </div>
-
-      {/* ── Row 4: Cumulative throughput ─────────────────────────────────────── */}
-      {(totalMsgsIn || totalMsgsOut || totalBytesIn || totalBytesOut) && (
-        <div className="overflow-hidden rounded-lg border border-border bg-card">
-          <div className="flex items-center gap-2 border-b border-border px-4 py-2.5">
-            <ArrowDownToLine size={13} className="text-nats-accent" />
-            <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Cumulative Throughput (since server start)</span>
-          </div>
-          <div className="grid grid-cols-2 md:grid-cols-4">
-            {[
-              { label: 'Total Msgs In',   value: totalMsgsIn,   icon: ArrowDownToLine,  color: 'text-nats-ok' },
-              { label: 'Total Msgs Out',  value: totalMsgsOut,  icon: ArrowUpFromLine,  color: 'text-blue-400' },
-              { label: 'Total Bytes In',  value: totalBytesIn,  icon: ArrowDownToLine,  color: 'text-purple-400' },
-              { label: 'Total Bytes Out', value: totalBytesOut, icon: ArrowUpFromLine,  color: 'text-amber-400' },
-            ].map(({ label, value, icon: Icon, color }) => (
-              <div key={label} className="border-r border-border p-4 last:border-r-0">
-                <div className="mb-1 flex items-center gap-1.5 text-xs text-muted-foreground">
-                  <Icon size={11} className={color} /> {label}
-                </div>
-                <div className={`font-mono text-lg font-semibold ${color}`}>{value ?? '—'}</div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* ── Row 5: JetStream storage/memory gauges ───────────────────────────── */}
-      {jsz && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <div className="space-y-3 rounded-lg border border-border bg-card p-4">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">JetStream Memory</span>
-              <span className="text-xs font-mono text-muted-foreground">
-                {formatBytes(jsMem)} {jsMemMax > 0 ? `/ ${formatBytes(jsMemMax)}` : '/ unlimited'}
-              </span>
-            </div>
-            <GaugeBar value={jsMem} max={jsMemMax > 0 ? jsMemMax : jsMem || 1} label="" showPercent={jsMemMax > 0} />
-            <div className="flex gap-4 text-xs text-muted-foreground">
-              <span>Reserved: {formatBytes(jsz.reserved_memory ?? 0)}</span>
-              <span>Messages: {(jsz.total_messages ?? jsz.messages ?? 0).toLocaleString()}</span>
-            </div>
-          </div>
-          <div className="space-y-3 rounded-lg border border-border bg-card p-4">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">JetStream Storage</span>
-              <span className="text-xs font-mono text-muted-foreground">
-                {formatBytes(jsStore)} {jsStoreMax > 0 ? `/ ${formatBytes(jsStoreMax)}` : '/ unlimited'}
-              </span>
-            </div>
-            <GaugeBar value={jsStore} max={jsStoreMax > 0 ? jsStoreMax : jsStore || 1} label="" showPercent={jsStoreMax > 0} />
-            <div className="flex gap-4 text-xs text-muted-foreground">
-              <span>Reserved: {formatBytes(jsz.reserved_storage ?? 0)}</span>
-              <span>Bytes stored: {formatBytes(jsz.total_message_bytes ?? jsz.bytes ?? 0)}</span>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ── Row 6: Server resources (CPU + Memory) ───────────────────────────── */}
-      {!viaProtocol && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <div className="space-y-3 rounded-lg border border-border bg-card p-4">
-            <div className="flex items-center gap-2">
-              <Cpu size={13} className="text-muted-foreground" />
-              <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">CPU Usage</span>
-              {varz.cores != null && <span className="ml-auto text-xs text-muted-foreground">{varz.cores} cores</span>}
-            </div>
-            {varz.cpu != null
-              ? <GaugeBar value={varz.cpu} max={100} label={`${varz.cpu.toFixed(1)}%`} />
-              : <div className="py-2 text-xs text-muted-foreground">CPU data unavailable</div>}
-          </div>
-          <div className="space-y-3 rounded-lg border border-border bg-card p-4">
-            <div className="flex items-center gap-2">
-              <MemoryStick size={13} className="text-muted-foreground" />
-              <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Memory</span>
-              {varz.mem != null && <span className="ml-auto text-xs font-mono text-foreground">{formatBytes(varz.mem)}</span>}
-            </div>
-            {varz.mem != null
-              ? <GaugeBar value={varz.mem} max={varz.mem} label="" showPercent={false} />
-              : <div className="py-2 text-xs text-muted-foreground">Memory data unavailable</div>}
-          </div>
-        </div>
-      )}
-
-      {/* ── Row 7: Server info + topology ────────────────────────────────────── */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* Server Info */}
-        <div className="overflow-hidden rounded-lg border border-border bg-card">
-          <div className="flex items-center gap-2 border-b border-border px-4 py-2.5">
-            <Server size={13} className="text-nats-accent" />
-            <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Server Info</span>
-          </div>
-          <div className="px-4 py-1">
-            <InfoRow label="Server ID"   mono>{varz.server_id ? `${varz.server_id.slice(0, 24)}…` : '—'}</InfoRow>
-            <InfoRow label="Name"        mono>{varz.server_name}</InfoRow>
-            <InfoRow label="Host"        mono>{varz.host && varz.port ? `${varz.host}:${varz.port}` : '—'}</InfoRow>
-            <InfoRow label="Go Runtime"  mono>{varz.go}</InfoRow>
-            <InfoRow label="CPU Cores"        >{varz.cores}</InfoRow>
-            <InfoRow label="Max Payload" mono>{varz.max_payload ? formatBytes(varz.max_payload) : '—'}</InfoRow>
-            <InfoRow label="Started">
-              {varz.start ? new Date(varz.start).toLocaleString() : varz.uptime ?? '—'}
-            </InfoRow>
-            <InfoRow label="Security">
-              <div className="flex gap-1 flex-wrap justify-end">
-                <Badge color={varz.auth_required ? 'green' : 'gray'} icon={varz.auth_required ? Lock : Unlock}>
-                  {varz.auth_required ? 'Auth required' : 'No auth'}
-                </Badge>
-                <Badge color={varz.tls_required ? 'green' : 'gray'} icon={varz.tls_required ? Shield : ShieldOff}>
-                  {varz.tls_required ? 'TLS required' : 'No TLS'}
-                </Badge>
-              </div>
-            </InfoRow>
-          </div>
-        </div>
-
-        {/* Topology */}
-        <div className="overflow-hidden rounded-lg border border-border bg-card">
-          <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
-            <div className="flex items-center gap-2">
-              <Network size={13} className="text-nats-accent" />
-              <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Topology</span>
-            </div>
-            {(varz.routes ?? varz.remotes ?? 0) > 0 || varz.cluster?.name ? (
-              <span className="text-xs px-1.5 py-0.5 rounded bg-nats-accent/20 text-nats-accent font-medium">Cluster</span>
-            ) : (
-              <span className="rounded bg-border/50 px-1.5 py-0.5 text-xs font-medium text-muted-foreground">Standalone</span>
+      <PollState data={varz} error={error} onRetry={refetch}>
+        {varz && (
+          <div className="space-y-5">
+            {viaProtocol && (
+              <AlertBanner variant="info" title="Connected over the NATS protocol">
+                JetStream data is fully available. CPU, memory, connections, subscriptions and cluster details need the
+                HTTP monitoring port — add a connection with <span className="font-mono">http://host:8222</span> for the full picture.
+              </AlertBanner>
             )}
-          </div>
-          <div className="grid grid-cols-2 gap-0 divide-x divide-border divide-y">
-            {[
-              { label: 'Cluster Routes',  value: varz.routes,    to: '/cluster' },
-              { label: 'Remote Servers',  value: varz.remotes,   to: '/cluster' },
-              { label: 'Leaf Nodes',      value: varz.leafnodes, to: '/leaf-nodes' },
-              { label: 'Gateways',        value: varz.gateways,  to: '/gateways' },
-              { label: 'Total Conns',     value: varz.total_connections != null ? varz.total_connections.toLocaleString() : null },
-              { label: 'Max Conns',       value: varz.max_connections != null ? varz.max_connections.toLocaleString() : null },
-            ].map(({ label, value, to }) => (
-              <div key={label} className="p-3">
-                <div className="mb-0.5 text-xs text-muted-foreground">{label}</div>
-                {to
-                  ? <Link to={to} className="font-mono text-sm text-nats-accent hover:underline">{value ?? '—'}</Link>
-                  : <div className="font-mono text-sm text-foreground">{value ?? '—'}</div>
-                }
+            {slowConsumers > 0 && (
+              <AlertBanner variant="error" title={`${slowConsumers.toLocaleString()} slow consumer event${slowConsumers === 1 ? '' : 's'} since start`}
+                action={<Link to="/connections" className="link text-xs">View connections</Link>}>
+                Clients could not keep up and were disconnected or dropped messages.
+              </AlertBanner>
+            )}
+
+            {/* KPIs */}
+            <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+              <MetricCard label="Connections" icon={Network} to={viaProtocol ? undefined : '/connections'}
+                value={varz.connections != null ? formatNumber(varz.connections) : '—'}
+                subtext={varz.total_connections != null ? `${formatNumber(varz.total_connections)} total since start` : viaProtocol ? 'Needs monitoring port' : undefined} />
+              <MetricCard label="Subscriptions" icon={Radio} to={viaProtocol ? undefined : '/subscriptions'}
+                value={varz.subscriptions != null ? formatNumber(varz.subscriptions) : '—'} />
+              <MetricCard label="Streams" icon={Database} to="/streams"
+                value={streams != null ? formatNumber(streams) : '—'}
+                subtext={jsz ? `${formatBytes(jsz.storage + jsz.memory)} stored` : 'JetStream'} />
+              <MetricCard label="Consumers" icon={Waves} to="/consumers"
+                value={consumers != null ? formatNumber(consumers) : '—'}
+                subtext={jsz ? `${formatNumber(apiErrors)} API errors` : undefined} />
+            </div>
+
+            {/* Throughput */}
+            {!viaProtocol && (
+              <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+                <ChartCard title="Messages / second" value={latest ? `↓ ${formatRate(latest.inMsgs, '')} · ↑ ${formatRate(latest.outMsgs, '')}` : 'collecting…'}>
+                  <TimeSeriesChart
+                    data={history}
+                    series={[{ key: 'inMsgs', label: 'In' }, { key: 'outMsgs', label: 'Out' }]}
+                    format={(v) => formatRate(v)}
+                  />
+                  <div className="mt-2 flex gap-4 text-[11px] text-muted-foreground">
+                    <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-chart-1" />In (received)</span>
+                    <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-chart-2" />Out (delivered)</span>
+                  </div>
+                </ChartCard>
+                <ChartCard title="Bytes / second" value={latest ? `↓ ${formatBytesRate(latest.inBytes)} · ↑ ${formatBytesRate(latest.outBytes)}` : 'collecting…'}>
+                  <TimeSeriesChart
+                    data={history}
+                    series={[{ key: 'inBytes', label: 'In' }, { key: 'outBytes', label: 'Out' }]}
+                    format={formatBytesRate}
+                  />
+                  <div className="mt-2 flex gap-4 text-[11px] text-muted-foreground">
+                    <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-chart-1" />In</span>
+                    <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-chart-2" />Out</span>
+                  </div>
+                </ChartCard>
               </div>
-            ))}
-          </div>
+            )}
 
-          {/* Cluster name + JetStream domain */}
-          {(varz.cluster?.name || jsz?.domain) && (
-            <div className="flex flex-wrap gap-3 border-t border-border px-4 py-3 text-xs">
-              {varz.cluster?.name && (
-                <span className="text-muted-foreground">Cluster: <span className="font-mono text-foreground">{varz.cluster.name}</span></span>
-              )}
-              {jsz?.domain && (
-                <span className="text-muted-foreground">JS Domain: <span className="font-mono text-foreground">{jsz.domain}</span></span>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
+            {/* Totals since start */}
+            {!viaProtocol && (
+              <div className="surface-card grid grid-cols-2 divide-border md:grid-cols-4 md:divide-x">
+                {[
+                  { label: 'Messages in', value: formatCompact(varz.in_msgs), full: formatNumber(varz.in_msgs), icon: ArrowDownToLine },
+                  { label: 'Messages out', value: formatCompact(varz.out_msgs), full: formatNumber(varz.out_msgs), icon: ArrowUpFromLine },
+                  { label: 'Bytes in', value: formatBytes(varz.in_bytes), icon: ArrowDownToLine },
+                  { label: 'Bytes out', value: formatBytes(varz.out_bytes), icon: ArrowUpFromLine },
+                ].map(({ label, value, full, icon: Icon }) => (
+                  <div key={label} className="p-4" title={full}>
+                    <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-muted-foreground">
+                      <Icon size={12} /> {label}
+                    </div>
+                    <div className="mt-1 font-mono text-lg font-semibold tabular">{value}</div>
+                    <div className="text-[11px] text-muted-foreground">since server start</div>
+                  </div>
+                ))}
+              </div>
+            )}
 
-      {/* ── Protocol-mode detail note ─────────────────────────────────────────── */}
-      {viaProtocol && (
-        <div className="rounded-lg border border-border bg-card p-4">
-          <div className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Available vs Unavailable Metrics</div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
-            <div>
-              <div className="text-nats-ok font-medium mb-1.5">✓ Available via NATS protocol</div>
-              <ul className="space-y-1 text-muted-foreground">
-                <li>Server identity (ID, name, version)</li>
-                <li>JetStream streams, consumers, state</li>
-                <li>Message rates (calculated from JS API)</li>
-                <li>All stream &amp; consumer operations</li>
-                <li>JetStream storage &amp; memory limits</li>
-              </ul>
-            </div>
-            <div>
-              <div className="text-nats-warn font-medium mb-1.5">✗ Requires HTTP port 8222</div>
-              <ul className="space-y-1 text-muted-foreground">
-                <li>CPU &amp; memory usage</li>
-                <li>Active connections list</li>
-                <li>Subscription details</li>
-                <li>Slow consumer detection</li>
-                <li>Cluster routes &amp; leaf nodes detail</li>
-              </ul>
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+              {/* Resources */}
+              <div className="surface-card space-y-4 p-4">
+                <div className="card-title">Resources</div>
+                {!viaProtocol && (
+                  <>
+                    <div>
+                      <div className="mb-1.5 flex items-center justify-between text-xs">
+                        <span className="flex items-center gap-1.5 text-muted-foreground"><Cpu size={12} /> CPU</span>
+                        <span className="font-mono tabular">{varz.cpu != null ? `${varz.cpu.toFixed(1)}%` : '—'}{varz.cores ? ` of ${varz.cores} cores` : ''}</span>
+                      </div>
+                      {/* /varz cpu is a percentage of one core */}
+                      <GaugeBar value={varz.cpu ?? 0} max={(varz.cores || 1) * 100} showPercent={false} />
+                    </div>
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="flex items-center gap-1.5 text-muted-foreground"><MemoryStick size={12} /> Memory (RSS)</span>
+                      <span className="font-mono tabular">{formatBytes(varz.mem)}</span>
+                    </div>
+                  </>
+                )}
+                {jsz && (
+                  <>
+                    <div>
+                      <div className="mb-1.5 flex items-center justify-between text-xs">
+                        <span className="text-muted-foreground">JetStream storage</span>
+                        <span className="font-mono tabular">{formatBytes(jsz.storage)}{jsz.config?.max_storage > 0 ? ` / ${formatBytes(jsz.config.max_storage)}` : ''}</span>
+                      </div>
+                      {jsz.config?.max_storage > 0 && <GaugeBar value={jsz.storage} max={jsz.config.max_storage} showPercent={false} />}
+                    </div>
+                    <div>
+                      <div className="mb-1.5 flex items-center justify-between text-xs">
+                        <span className="text-muted-foreground">JetStream memory</span>
+                        <span className="font-mono tabular">{formatBytes(jsz.memory)}{jsz.config?.max_memory > 0 ? ` / ${formatBytes(jsz.config.max_memory)}` : ''}</span>
+                      </div>
+                      {jsz.config?.max_memory > 0 && <GaugeBar value={jsz.memory} max={jsz.config.max_memory} showPercent={false} />}
+                    </div>
+                  </>
+                )}
+                {!jsz && viaProtocol && <p className="text-xs text-muted-foreground">Resource metrics need the monitoring port.</p>}
+              </div>
+
+              {/* Server info */}
+              <div className="surface-card overflow-hidden">
+                <div className="card-header"><Server size={13} className="text-primary" /><span className="card-title">Server</span></div>
+                <div className="px-4 py-1">
+                  <InfoRow label="Name" mono>{varz.server_name}</InfoRow>
+                  <InfoRow label="Server ID" mono>{varz.server_id ? `${varz.server_id.slice(0, 16)}…` : '—'}</InfoRow>
+                  <InfoRow label="Version" mono>{varz.version}{varz.go ? ` (${varz.go})` : ''}</InfoRow>
+                  <InfoRow label="Listen" mono>{varz.host != null && varz.port != null ? `${varz.host}:${varz.port}` : '—'}</InfoRow>
+                  <InfoRow label="Max payload" mono>{varz.max_payload ? formatBytes(varz.max_payload) : '—'}</InfoRow>
+                  <InfoRow label="Started">{formatDateTime(varz.start)}</InfoRow>
+                  <InfoRow label="Security">
+                    <span className="inline-flex flex-wrap justify-end gap-1">
+                      <StatusBadge status={varz.auth_required ? 'ok' : 'neutral'}>
+                        {varz.auth_required ? <Lock size={10} /> : <Unlock size={10} />}{varz.auth_required ? 'Auth' : 'No auth'}
+                      </StatusBadge>
+                      <StatusBadge status={varz.tls_required ? 'ok' : 'neutral'}>
+                        {varz.tls_required ? <Shield size={10} /> : <ShieldOff size={10} />}{varz.tls_required ? 'TLS' : 'No TLS'}
+                      </StatusBadge>
+                    </span>
+                  </InfoRow>
+                </div>
+              </div>
+
+              {/* Topology */}
+              <div className="surface-card overflow-hidden">
+                <div className="card-header justify-between">
+                  <span className="flex items-center gap-2"><Network size={13} className="text-primary" /><span className="card-title">Topology</span></span>
+                  {!viaProtocol && <StatusBadge status={isCluster ? 'accent' : 'neutral'}>{isCluster ? 'Cluster' : 'Standalone'}</StatusBadge>}
+                </div>
+                <div className="grid grid-cols-2">
+                  {[
+                    { label: 'Routes', value: varz.routes, to: '/cluster' },
+                    { label: 'Remotes', value: varz.remotes, to: '/cluster' },
+                    { label: 'Leaf nodes', value: varz.leafnodes, to: '/leaf-nodes' },
+                    { label: 'Gateways', value: varz.gateways ?? (varz.gateway?.name ? 1 : 0), to: '/gateways' },
+                  ].map(({ label, value, to }) => (
+                    <Link key={label} to={to} className="border-b border-r border-border p-3 transition-colors even:border-r-0 hover:bg-muted/40">
+                      <div className="text-[11px] text-muted-foreground">{label}</div>
+                      <div className="font-mono text-lg tabular">{value ?? '—'}</div>
+                    </Link>
+                  ))}
+                </div>
+                <div className="space-y-1 px-4 py-3 text-xs">
+                  {varz.cluster?.name && <div className="text-muted-foreground">Cluster <span className="font-mono text-foreground">{varz.cluster.name}</span></div>}
+                  {jsz?.domain && <div className="text-muted-foreground">JetStream domain <span className="font-mono text-foreground">{jsz.domain}</span></div>}
+                  {apiErrors > 0 && (
+                    <div className="flex items-center gap-1.5 text-nats-warn"><AlertTriangle size={12} /> {formatNumber(apiErrors)} JetStream API errors since start</div>
+                  )}
+                  {!varz.cluster?.name && !jsz?.domain && apiErrors === 0 && (
+                    <div className="flex items-center gap-1.5 text-muted-foreground"><Info size={12} /> No cluster or domain configured</div>
+                  )}
+                </div>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
+      </PollState>
     </div>
   )
 }

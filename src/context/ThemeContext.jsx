@@ -1,50 +1,40 @@
-import { createContext, useContext, useState, useEffect } from 'react'
+import { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react'
 
 export const THEMES = [
-  {
-    id:      'dark',
-    label:   'Dark',
-    swatch:  { bg: '#0f1117', card: '#1a1d27', accent: '#d8d8d8' },
-  },
-  {
-    id:      'light',
-    label:   'Light',
-    swatch:  { bg: '#f4f4f5', card: '#ffffff', accent: '#52525b' },
-  },
+  { id: 'dark',  label: 'Dark' },
+  { id: 'light', label: 'Light' },
 ]
 
 const STORAGE_KEY = 'nats-dashboard-theme'
 
 const ThemeContext = createContext(null)
 
-export function ThemeProvider({ children }) {
-  const isValidTheme = (id) => THEMES.some((themeOption) => themeOption.id === id)
-
-  const [theme, setThemeState] = useState(() => {
-    const savedTheme = localStorage.getItem(STORAGE_KEY)
-    return isValidTheme(savedTheme) ? savedTheme : 'dark'
-  })
-
-  const setTheme = (id) => {
-    const nextTheme = isValidTheme(id) ? id : 'dark'
-    setThemeState(nextTheme)
-    localStorage.setItem(STORAGE_KEY, nextTheme)
+function initialTheme() {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY)
+    if (THEMES.some((t) => t.id === saved)) return saved
+    return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
+  } catch {
+    return 'dark'
   }
+}
+
+export function ThemeProvider({ children }) {
+  const [theme, setThemeState] = useState(initialTheme)
+
+  const setTheme = useCallback((id) => {
+    const next = THEMES.some((t) => t.id === id) ? id : 'dark'
+    setThemeState(next)
+    try { localStorage.setItem(STORAGE_KEY, next) } catch { /* ignore */ }
+  }, [])
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
   }, [theme])
 
-  // Apply once on mount so SSR/hydration has the right class immediately
-  useEffect(() => {
-    document.documentElement.setAttribute('data-theme', theme)
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  const value = useMemo(() => ({ theme, setTheme, themes: THEMES }), [theme, setTheme])
 
-  return (
-    <ThemeContext.Provider value={{ theme, setTheme, themes: THEMES }}>
-      {children}
-    </ThemeContext.Provider>
-  )
+  return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>
 }
 
 export function useTheme() {

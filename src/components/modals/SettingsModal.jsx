@@ -1,32 +1,23 @@
-import { useState, useEffect } from 'react'
-import { useConfig } from '../../context/ConfigContext'
-import { setLastConnection } from '../../hooks/useSavedConnections'
+import { Moon, Sun, Trash2, Pencil } from 'lucide-react'
+import { useConfig, POLL_OPTIONS } from '../../context/ConfigContext'
+import { useTheme } from '../../context/ThemeContext'
+import { useAuth } from '../../context/AuthContext'
 import { Button } from '../ui/button'
-import { Input } from '../ui/input'
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '../ui/dialog'
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '../ui/dialog'
+import { useConfirmDialog } from '../shared/ConfirmDialogProvider'
+import { cn } from '../../lib/utils'
 
-export function SettingsModal({ open, onClose }) {
-  const { serverUrl, setServerUrl, pollInterval, setPollInterval, setSelectedContext, authToken, setAuthToken } = useConfig()
+const label = (ms) => (ms < 60000 ? `${ms / 1000}s` : `${ms / 60000}m`)
 
-  const [url,             setUrl]             = useState(serverUrl)
-  const [refreshInterval, setRefreshInterval] = useState(pollInterval)
-  const [token,           setToken]           = useState(authToken || '')
+export function SettingsModal({ open, onClose, onEditConnection }) {
+  const { pollInterval, setPollInterval, savedConnections, removeConnection, connection } = useConfig()
+  const { theme, setTheme } = useTheme()
+  const { confirm } = useConfirmDialog()
+  const { version } = useAuth()
 
-  useEffect(() => {
-    if (open) {
-      setUrl(serverUrl)
-      setRefreshInterval(pollInterval)
-      setToken(authToken || '')
-    }
-  }, [open, serverUrl, pollInterval, authToken])
-
-  const handleSave = () => {
-    setServerUrl(url)
-    setPollInterval(Number(refreshInterval) || 2000)
-    setAuthToken(token.trim() || null)
-    setSelectedContext(null)
-    setLastConnection(null)
-    onClose()
+  const handleRemove = async (c) => {
+    const ok = await confirm(`Remove "${c.name}"?`, 'The saved connection (and its token) is removed from this browser.', { confirmLabel: 'Remove', destructive: true })
+    if (ok) removeConnection(c.id)
   }
 
   return (
@@ -34,55 +25,76 @@ export function SettingsModal({ open, onClose }) {
       <DialogContent className="max-w-lg">
         <DialogHeader>
           <DialogTitle>Settings</DialogTitle>
-          <DialogDescription>Connection and polling interval settings.</DialogDescription>
+          <DialogDescription>Preferences are stored in this browser.{version ? ` · NATS Dashboard v${version}` : ''}</DialogDescription>
         </DialogHeader>
-        <div className="space-y-5">
-          {/* Connection */}
-          <div>
-            <label className="mb-1 block text-sm text-muted-foreground">NATS Monitoring URL</label>
-            <Input
-              type="text"
-              value={url}
-              onChange={e => setUrl(e.target.value)}
-              placeholder="http://localhost:8222"
-              className="font-mono"
-            />
-          </div>
 
-          <div>
-            <label className="mb-1 block text-sm text-muted-foreground">Auth Token (optional)</label>
-            <Input
-              type="password"
-              value={token}
-              onChange={e => setToken(e.target.value)}
-              placeholder="Bearer token for secured NATS"
-              className="font-mono"
-            />
-          </div>
+        <div className="space-y-6">
+          <section>
+            <div className="field-label">Refresh interval</div>
+            <div className="flex flex-wrap gap-1.5">
+              {POLL_OPTIONS.map((ms) => (
+                <button
+                  key={ms}
+                  type="button"
+                  onClick={() => setPollInterval(ms)}
+                  className={cn(
+                    'rounded-md border px-3 py-1.5 font-mono text-xs transition-colors',
+                    pollInterval === ms ? 'border-primary/50 bg-primary/10 text-primary' : 'border-border text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  {label(ms)}
+                </button>
+              ))}
+            </div>
+            <p className="field-hint">How often monitoring data is refreshed. Polling pauses automatically while the tab is hidden.</p>
+          </section>
 
-          <div>
-            <label className="mb-1 block text-sm text-muted-foreground">Poll Interval (ms)</label>
-            <Input
-              type="number"
-              value={refreshInterval}
-              onChange={e => setRefreshInterval(e.target.value)}
-              min={1000}
-              max={30000}
-              step={1000}
-              className="font-mono"
-            />
-          </div>
+          <section>
+            <div className="field-label">Theme</div>
+            <div className="flex gap-1.5">
+              {[{ id: 'dark', icon: Moon, text: 'Dark' }, { id: 'light', icon: Sun, text: 'Light' }].map(({ id, icon: Icon, text }) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => setTheme(id)}
+                  className={cn(
+                    'inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs transition-colors',
+                    theme === id ? 'border-primary/50 bg-primary/10 text-primary' : 'border-border text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  <Icon size={13} /> {text}
+                </button>
+              ))}
+            </div>
+          </section>
 
+          <section>
+            <div className="field-label">Saved connections</div>
+            {savedConnections.length === 0 ? (
+              <p className="text-xs text-muted-foreground">No saved connections. Add one from the connection menu in the top bar.</p>
+            ) : (
+              <div className="divide-y divide-border rounded-md border border-border">
+                {savedConnections.map((c) => (
+                  <div key={c.id} className="flex items-center gap-2 px-3 py-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm font-medium">
+                        {c.name}
+                        {connection?.id === c.id && <span className="ml-2 text-[10px] uppercase tracking-wide text-primary">active</span>}
+                      </div>
+                      <div className="truncate font-mono text-[11px] text-muted-foreground">{c.monitoringUrl}</div>
+                    </div>
+                    <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => onEditConnection?.(c)} title="Edit">
+                      <Pencil size={13} />
+                    </Button>
+                    <Button variant="ghost" size="icon" className="h-7 w-7 hover:text-nats-error" onClick={() => handleRemove(c)} title="Remove">
+                      <Trash2 size={13} />
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
         </div>
-
-        <DialogFooter className="mt-6">
-          <Button onClick={onClose} variant="outline">
-            Cancel
-          </Button>
-          <Button onClick={handleSave}>
-            Save
-          </Button>
-        </DialogFooter>
       </DialogContent>
     </Dialog>
   )

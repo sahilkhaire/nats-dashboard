@@ -1,26 +1,29 @@
-import { createContext, useContext, useState, useEffect, useCallback } from 'react'
+import { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react'
 
 const AuthContext = createContext(null)
 
 export function AuthProvider({ children }) {
   const [authenticated, setAuthenticated] = useState(null)
+  const [authEnabled, setAuthEnabled] = useState(false)
+  const [version, setVersion] = useState(null)
   const [loading, setLoading] = useState(true)
 
   const checkAuth = useCallback(async () => {
     try {
       const res = await fetch('/api/auth/me', { credentials: 'include' })
-      const data = await res.json()
+      const data = await res.json().catch(() => ({}))
       setAuthenticated(data.authenticated === true)
+      setAuthEnabled(data.authEnabled === true)
+      setVersion(data.version || null)
     } catch {
-      setAuthenticated(false)
+      // Static hosting without the API server: let the app render and surface errors per page.
+      setAuthenticated(true)
     } finally {
       setLoading(false)
     }
   }, [])
 
-  useEffect(() => {
-    checkAuth()
-  }, [checkAuth])
+  useEffect(() => { checkAuth() }, [checkAuth])
 
   useEffect(() => {
     const onAuthRequired = () => setAuthenticated(false)
@@ -28,31 +31,36 @@ export function AuthProvider({ children }) {
     return () => window.removeEventListener('auth-required', onAuthRequired)
   }, [])
 
-  const login = async (username, password) => {
-    const res = await fetch('/api/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ username, password }),
-    })
-    const data = await res.json()
-    if (res.ok && data.ok) {
-      setAuthenticated(true)
-      return { ok: true }
+  const login = useCallback(async (username, password) => {
+    try {
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ username, password }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && data.ok) {
+        setAuthenticated(true)
+        return { ok: true }
+      }
+      return { ok: false, error: data.error || `Login failed (HTTP ${res.status})` }
+    } catch (err) {
+      return { ok: false, error: err.message || 'Network error' }
     }
-    return { ok: false, error: data.error || 'Login failed' }
-  }
+  }, [])
 
-  const logout = async () => {
-    await fetch('/api/logout', { method: 'POST', credentials: 'include' })
+  const logout = useCallback(async () => {
+    try { await fetch('/api/logout', { method: 'POST', credentials: 'include' }) } catch { /* ignore */ }
     setAuthenticated(false)
-  }
+  }, [])
 
-  return (
-    <AuthContext.Provider value={{ authenticated, loading, login, logout, checkAuth }}>
-      {children}
-    </AuthContext.Provider>
+  const value = useMemo(
+    () => ({ authenticated, authEnabled, version, loading, login, logout, checkAuth }),
+    [authenticated, authEnabled, version, loading, login, logout, checkAuth],
   )
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
 
 export function useAuth() {

@@ -1,160 +1,50 @@
-import { useCallback } from 'react'
+import { useMemo } from 'react'
 import { useConfig } from '../context/ConfigContext'
+import { apiRequest } from '../lib/api'
 
+/**
+ * JetStream management API bound to the selected connection.
+ */
 export function useStreamMutation() {
-  const { serverUrl, authToken } = useConfig()
+  const { connection } = useConfig()
 
-  const parseResponse = useCallback(async (res, fallbackError) => {
-    const contentType = res.headers.get('content-type') || ''
-    if (contentType.includes('application/json')) {
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error || fallbackError)
-      return data
+  return useMemo(() => {
+    const post = (path, body) => apiRequest(connection, path, { method: 'POST', body })
+    const get = (path, query) => apiRequest(connection, path, { query })
+    const del = (path) => apiRequest(connection, path, { method: 'DELETE' })
+
+    return {
+      // ── Streams ────────────────────────────────────────────────────────────
+      createStream: (config) => post('/api/stream/create', { config }),
+      deleteStream: (stream) => post('/api/stream/delete', { stream }),
+      updateStream: (stream, config) => post('/api/stream/update', { stream, config }),
+      purgeStream: (stream, subject, extra = {}) => post('/api/stream/purge', { stream, subject: subject || undefined, ...extra }),
+      duplicateStream: (stream, target, config) => post('/api/stream/duplicate', { stream, target, config }),
+      createMirrorStream: (stream, target, mirror, config) => post('/api/stream/mirror', { stream, target, mirror, config }),
+      stepDownLeader: (stream) => post('/api/stream/step-down', { stream }),
+      removeFollowers: (stream, peers) => post('/api/stream/remove-followers', { stream, peers }),
+      sealStream: (stream) => post('/api/stream/seal', { stream }),
+      deleteMessage: (stream, seq) => post('/api/stream/message/delete', { stream, seq }),
+      getStreamCliConfig: (stream) => get('/api/stream/config-cli', { stream }),
+      getStreamTerraformConfig: (stream) => get('/api/stream/config-terraform', { stream }),
+      fetchMessages: (query) => get('/api/stream/messages', query),
+
+      // ── Consumers ──────────────────────────────────────────────────────────
+      createConsumer: (stream, config) => post('/api/consumer/create', { stream, config }),
+      deleteConsumer: (stream, consumer) => post('/api/consumer/delete', { stream, consumer }),
+
+      // ── Scheduled purges ───────────────────────────────────────────────────
+      listSchedules: async (stream) => (await get('/api/stream/schedules', { stream })).schedules ?? [],
+      createSchedule: (params) => post('/api/stream/schedule', params),
+      deleteSchedule: (id) => del(`/api/stream/schedule/${encodeURIComponent(id)}`),
+
+      // ── Publish ────────────────────────────────────────────────────────────
+      /**
+       * @param {{ stream, subject, payload?, encoding?, headers?: {key,value}[], msgTtl?, msgId?, scheduleAt? }} params
+       */
+      publishMessage: (params) => post('/api/stream/publish', params),
+      listScheduledPublishes: async (stream) => (await get('/api/stream/publishes', { stream })).publishes ?? [],
+      cancelScheduledPublish: (id) => del(`/api/stream/publish/${encodeURIComponent(id)}`),
     }
-    const text = await res.text()
-    if (!res.ok) throw new Error(fallbackError)
-    throw new Error(text?.startsWith('<!DOCTYPE') ? 'Unexpected server response. Please retry.' : fallbackError)
-  }, [])
-
-  const post = useCallback(async (path, body) => {
-    const res = await fetch(path, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ server: serverUrl, token: authToken, ...body }),
-    })
-    return parseResponse(res, `Request to ${path} failed`)
-  }, [serverUrl, authToken, parseResponse])
-
-  const get = useCallback(async (path) => {
-    const params = new URLSearchParams()
-    if (serverUrl) params.set('server', serverUrl)
-    if (authToken) params.set('token', authToken)
-    const sep = path.includes('?') ? '&' : '?'
-    const url = `${path}${params.size > 0 ? `${sep}${params.toString()}` : ''}`
-    const res = await fetch(url, { credentials: 'include' })
-    return parseResponse(res, `Request to ${path} failed`)
-  }, [serverUrl, authToken, parseResponse])
-
-  // ── Stream mutations ───────────────────────────────────────────────────────
-
-  const deleteStream = useCallback(
-    (streamName) => post('/api/stream/delete', { stream: streamName }),
-    [post]
-  )
-
-  const updateStream = useCallback(
-    (streamName, config) => post('/api/stream/update', { stream: streamName, config }),
-    [post]
-  )
-
-  const purgeStream = useCallback(
-    (streamName, subject) => post('/api/stream/purge', { stream: streamName, subject: subject || undefined }),
-    [post]
-  )
-
-  const duplicateStream = useCallback(
-    (streamName, target, config) => post('/api/stream/duplicate', { stream: streamName, target, config }),
-    [post]
-  )
-
-  const createMirrorStream = useCallback(
-    (streamName, target, mirror, config) => post('/api/stream/mirror', { stream: streamName, target, mirror, config }),
-    [post]
-  )
-
-  const stepDownLeader = useCallback(
-    (streamName) => post('/api/stream/step-down', { stream: streamName }),
-    [post]
-  )
-
-  const removeFollowers = useCallback(
-    (streamName, peers) => post('/api/stream/remove-followers', { stream: streamName, peers }),
-    [post]
-  )
-
-  const sealStream = useCallback(
-    (streamName) => post('/api/stream/seal', { stream: streamName }),
-    [post]
-  )
-
-  const getStreamCliConfig = useCallback(
-    (streamName) => get(`/api/stream/config-cli?stream=${encodeURIComponent(streamName)}`),
-    [get]
-  )
-
-  const getStreamTerraformConfig = useCallback(
-    (streamName) => get(`/api/stream/config-terraform?stream=${encodeURIComponent(streamName)}`),
-    [get]
-  )
-
-  // ── Scheduled purges ───────────────────────────────────────────────────────
-
-  const listSchedules = useCallback(async (streamName) => {
-    const res = await fetch(`/api/stream/schedules?stream=${encodeURIComponent(streamName)}`, {
-      credentials: 'include',
-    })
-    const data = await res.json()
-    if (!res.ok) throw new Error(data.error || 'Failed to load schedules')
-    return data.schedules ?? []
-  }, [])
-
-  const createSchedule = useCallback(
-    (params) => post('/api/stream/schedule', params),
-    [post]
-  )
-
-  const deleteSchedule = useCallback(async (id) => {
-    const res = await fetch(`/api/stream/schedule/${encodeURIComponent(id)}`, {
-      method: 'DELETE',
-      credentials: 'include',
-    })
-    const data = await res.json()
-    if (!res.ok) throw new Error(data.error || 'Failed to delete schedule')
-    return data
-  }, [])
-
-  // ── Message publish ────────────────────────────────────────────────────────
-
-  /**
-   * Publish a message to a JetStream stream.
-   * @param {object} params
-   * @param {string} params.stream       - Stream name
-   * @param {string} params.subject      - Target subject (must match stream subjects)
-   * @param {string} [params.payload]    - Message body (string or JSON)
-   * @param {Array}  [params.headers]    - [{ key, value }, ...] extra NATS headers
-   * @param {string} [params.msgTtl]     - e.g. "1h" — requires allow_msg_ttl on stream
-   * @param {string} [params.scheduleAt] - ISO datetime string — delay delivery until this time
-   */
-  const publishMessage = useCallback(
-    (params) => post('/api/stream/publish', params),
-    [post]
-  )
-
-  const listScheduledPublishes = useCallback(async (streamName) => {
-    const res = await fetch(`/api/stream/publishes?stream=${encodeURIComponent(streamName)}`, {
-      credentials: 'include',
-    })
-    const data = await res.json()
-    if (!res.ok) throw new Error(data.error || 'Failed to load scheduled publishes')
-    return data.publishes ?? []
-  }, [])
-
-  const cancelScheduledPublish = useCallback(async (id) => {
-    const res = await fetch(`/api/stream/publish/${encodeURIComponent(id)}`, {
-      method: 'DELETE',
-      credentials: 'include',
-    })
-    const data = await res.json()
-    if (!res.ok) throw new Error(data.error || 'Failed to cancel')
-    return data
-  }, [])
-
-  return {
-    deleteStream, updateStream, purgeStream,
-    duplicateStream, createMirrorStream, stepDownLeader, removeFollowers, sealStream,
-    getStreamCliConfig, getStreamTerraformConfig,
-    listSchedules, createSchedule, deleteSchedule,
-    publishMessage, listScheduledPublishes, cancelScheduledPublish,
-  }
+  }, [connection])
 }

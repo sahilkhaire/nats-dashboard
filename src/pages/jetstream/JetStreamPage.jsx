@@ -1,106 +1,99 @@
-import { useRef, useEffect } from 'react'
+import { useRef } from 'react'
 import { Link } from 'react-router-dom'
+import { Activity, Database, ExternalLink, Gauge, HardDrive, MemoryStick } from 'lucide-react'
 import { useNatsPolling } from '../../hooks/useNatsPolling'
-import { MetricCard } from '../../components/MetricCard'
-import { GaugeBar } from '../../components/GaugeBar'
-import { formatBytes } from '../../utils/byteFormatter'
-import { AlertBanner } from '../../components/AlertBanner'
-import { Activity, ExternalLink } from 'lucide-react'
+import { MetricCard } from '../../components/ui/MetricCard'
+import { GaugeBar } from '../../components/ui/GaugeBar'
+import { PageHeader } from '../../components/shared/PageHeader'
+import { PollState } from '../../components/shared/PageState'
+import { TimeSeriesChart } from '../../components/charts/TimeSeriesChart'
+import { formatBytes, formatNumber, formatRate } from '../../utils/byteFormatter'
+
+/** API call rate history keyed on fetch time. */
+function useApiRate(total, errors, lastFetch) {
+  const ref = useRef({ processedAt: null, prev: null, history: [] })
+  const st = ref.current
+  if (lastFetch == null || total == null || st.processedAt === lastFetch) return st.history
+  let history = st.history
+  if (st.prev && lastFetch > st.prev.at) {
+    const dt = (lastFetch - st.prev.at) / 1000
+    history = [...history, {
+      ts: lastFetch,
+      calls: Math.max(0, (total - st.prev.total) / dt),
+      errors: Math.max(0, (errors - st.prev.errors) / dt),
+    }].slice(-90)
+  }
+  ref.current = { processedAt: lastFetch, prev: { at: lastFetch, total, errors }, history }
+  return history
+}
+
+function UsageCard({ title, icon: Icon, used, max, reserved }) {
+  const limited = max != null && max > 0
+  return (
+    <div className="surface-card space-y-3 p-4">
+      <div className="flex items-center justify-between">
+        <span className="flex items-center gap-2 text-sm font-medium"><Icon size={14} className="text-muted-foreground" />{title}</span>
+        <span className="font-mono text-sm tabular">{formatBytes(used)} <span className="text-muted-foreground">/ {limited ? formatBytes(max) : 'unlimited'}</span></span>
+      </div>
+      {limited ? <GaugeBar value={used} max={max} label="Used" /> : <div className="text-xs text-muted-foreground">No account limit configured</div>}
+      {reserved > 0 && <div className="text-xs text-muted-foreground">Reserved by stream limits: <span className="font-mono">{formatBytes(reserved)}</span></div>}
+    </div>
+  )
+}
 
 export function JetStreamPage() {
-  const { data, error } = useNatsPolling('/jsz?accounts=true', 3000)
-  const apiRateRef = useRef({ total: null, ts: null })
-  const apiTotal = data?.api?.total ?? 0
-
-  useEffect(() => {
-    apiRateRef.current = { total: apiTotal, ts: Date.now() }
-  }, [apiTotal])
-
-  if (error) return <div className="p-6"><AlertBanner variant="error" title="Error">{error}</AlertBanner></div>
-  if (!data) return <div className="p-6 text-muted-foreground">Loading...</div>
-
-  const mem = data.memory ?? 0
-  const rawMaxMem = data.config?.max_memory
-  const maxMem = rawMaxMem == null ? null : rawMaxMem === 0 ? null : rawMaxMem
-  const storage = data.storage ?? 0
-  const rawMaxStorage = data.config?.max_storage
-  const maxStorage = rawMaxStorage == null ? null : rawMaxStorage === 0 ? null : rawMaxStorage
-
-  const prev = apiRateRef.current
-  const now = Date.now()
-  const elapsed = prev.ts != null ? (now - prev.ts) / 1000 : 0
-  const apiCallsPerSec = elapsed > 0 && prev.total != null
-    ? Math.max(0, Math.round((apiTotal - prev.total) / elapsed))
-    : null
+  const { data, error, lastFetch, refetch } = useNatsPolling('/jsz?accounts=true')
+  const history = useApiRate(data?.api?.total, data?.api?.errors ?? 0, lastFetch)
+  const latest = history[history.length - 1]
 
   return (
-    <div className="space-y-6">
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <div className="rounded-lg border border-border bg-card p-4">
-          {maxMem != null
-            ? <><GaugeBar value={mem} max={maxMem} label="Memory Used" /><div className="text-xs mt-1">{formatBytes(mem)} / {formatBytes(maxMem)}</div></>
-            : <><div className="mb-1 text-sm text-muted-foreground">Memory Used</div><div className="font-mono text-lg text-foreground">{formatBytes(mem)}</div><div className="text-xs text-muted-foreground">Unlimited</div></>
-          }
-        </div>
-        <div className="rounded-lg border border-border bg-card p-4">
-          {maxStorage != null
-            ? <><GaugeBar value={storage} max={maxStorage} label="Storage Used" /><div className="text-xs mt-1">{formatBytes(storage)} / {formatBytes(maxStorage)}</div></>
-            : <><div className="mb-1 text-sm text-muted-foreground">Storage Used</div><div className="font-mono text-lg text-foreground">{formatBytes(storage)}</div><div className="text-xs text-muted-foreground">Unlimited</div></>
-          }
-        </div>
-        <MetricCard label="API Calls" value={(data.api?.total ?? 0).toLocaleString()} />
-        <MetricCard label="API Errors" value={data.api?.errors ?? 0} variant={(data.api?.errors ?? 0) > 0 ? 'error' : 'default'} />
-      </div>
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <MetricCard label="Streams"      value={(data.total_streams  ?? data.streams   ?? 0).toLocaleString()} />
-        <MetricCard label="Consumers"    value={(data.total_consumers ?? data.consumers ?? 0).toLocaleString()} />
-        <MetricCard label="Messages"     value={(data.total_messages  ?? data.messages  ?? 0).toLocaleString()} />
-        <MetricCard label="Bytes Stored" value={formatBytes(data.total_message_bytes ?? data.bytes)} />
-      </div>
+    <div>
+      <PageHeader title="JetStream" icon={Gauge} description="Persistence layer: storage, memory and API activity" />
+      <PollState data={data} error={error} onRetry={refetch}>
+        {data && (
+          <div className="space-y-5">
+            {data.disabled && (
+              <div className="surface-card p-4 text-sm text-nats-warn">JetStream is disabled on this server.</div>
+            )}
+            <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+              <MetricCard label="Streams" icon={Database} to="/streams" value={formatNumber(data.total_streams ?? data.streams ?? 0)} />
+              <MetricCard label="Consumers" to="/consumers" value={formatNumber(data.total_consumers ?? data.consumers ?? 0)} />
+              <MetricCard label="Messages" value={formatNumber(data.total_messages ?? data.messages ?? 0)} subtext={formatBytes(data.total_message_bytes ?? data.bytes ?? 0)} />
+              <MetricCard label="API errors" value={formatNumber(data.api?.errors ?? 0)} tone={(data.api?.errors ?? 0) > 0 ? 'warn' : 'default'}
+                subtext={`of ${formatNumber(data.api?.total ?? 0)} calls`} />
+            </div>
 
-      {/* JetStream internal traffic */}
-      <div className="overflow-hidden rounded-lg border border-border bg-card">
-        <div className="flex items-center justify-between gap-2 border-b border-border px-4 py-2.5">
-          <div className="flex items-center gap-2">
-            <Activity size={14} className="text-nats-accent" />
-            <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">JetStream Internal Traffic</span>
-          </div>
-          <Link
-            to="/subscriptions?filter=js"
-            className="text-xs text-nats-accent hover:underline inline-flex items-center gap-1"
-          >
-            View $JS.* subscriptions <ExternalLink size={10} />
-          </Link>
-        </div>
-        <div className="p-4">
-          <p className="mb-4 text-xs text-muted-foreground">
-            JetStream uses internal subjects (<code className="text-foreground">$JS.*</code>) for stream/consumer operations, heartbeats, and acks.
-            API Calls below reflect this internal traffic.
-          </p>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <div>
-              <div className="mb-0.5 text-xs text-muted-foreground">API Calls (total)</div>
-              <div className="font-mono text-lg text-foreground">{(data.api?.total ?? 0).toLocaleString()}</div>
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+              <UsageCard title="File storage" icon={HardDrive} used={data.storage ?? 0} max={data.config?.max_storage} reserved={data.reserved_storage} />
+              <UsageCard title="Memory storage" icon={MemoryStick} used={data.memory ?? 0} max={data.config?.max_memory} reserved={data.reserved_memory} />
             </div>
-            <div>
-              <div className="mb-0.5 text-xs text-muted-foreground">API Calls/sec</div>
-              <div className="font-mono text-lg text-nats-accent">
-                {apiCallsPerSec != null ? `${apiCallsPerSec.toLocaleString()} /s` : '—'}
+
+            <div className="surface-card p-4">
+              <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+                <span className="flex items-center gap-2 text-sm font-medium"><Activity size={14} className="text-primary" /> API calls / second</span>
+                <span className="font-mono text-sm tabular">{latest ? formatRate(latest.calls, 'calls/s') : 'collecting…'}</span>
+              </div>
+              <TimeSeriesChart data={history} series={[{ key: 'calls', label: 'Calls' }, { key: 'errors', label: 'Errors', colorIndex: 1 }]} format={(v) => formatRate(v, '/s')} />
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">
+                <span className="flex gap-4">
+                  <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-chart-1" />Calls</span>
+                  <span className="inline-flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-chart-2" />Errors</span>
+                </span>
+                <span>API level {data.api?.level ?? '—'}{data.domain ? ` · domain ${data.domain}` : ''}</span>
               </div>
             </div>
-            <div>
-              <div className="mb-0.5 text-xs text-muted-foreground">API Errors</div>
-              <div className={`font-mono text-lg ${(data.api?.errors ?? 0) > 0 ? 'text-nats-error' : 'text-foreground'}`}>
-                {data.api?.errors ?? 0}
-              </div>
-            </div>
-            <div>
-              <div className="mb-0.5 text-xs text-muted-foreground">API Level</div>
-              <div className="font-mono text-lg text-foreground">{data.api?.level ?? '—'}</div>
+
+            <div className="surface-card flex flex-wrap items-center justify-between gap-3 p-4 text-sm">
+              <span className="text-muted-foreground">
+                JetStream uses internal <span className="font-mono text-foreground">$JS.*</span> subjects for its API, acks and flow control.
+              </span>
+              <Link to="/subscriptions?filter=js" className="link inline-flex items-center gap-1 text-xs">
+                View $JS subscriptions <ExternalLink size={11} />
+              </Link>
             </div>
           </div>
-        </div>
-      </div>
+        )}
+      </PollState>
     </div>
   )
 }

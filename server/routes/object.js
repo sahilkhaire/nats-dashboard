@@ -1,261 +1,56 @@
-import { readJsonBody } from '../utils/http.js'
-import { getObject, putObject, runCommand, runObject, streamWatch } from '../services/kv-object.js'
+/**
+ * Object store routes (see docs/kv-object-api-contract.md).
+ */
 
-function getConn(body, NATS_URL, NATS_TOKEN) {
-  return {
-    server: body?.server || NATS_URL || null,
-    token: body?.token || NATS_TOKEN || null,
-  }
+import * as oss from '../services/kv-object.js'
+import { readJsonBody, getQuery, sendJson, route } from '../utils/http.js'
+
+function contentDisposition(name) {
+  const base = String(name).split('/').pop() || 'download'
+  const ascii = base.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_')
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(base)}`
 }
 
-function sendResult(res, result, fallbackError) {
-  if (!result.ok) {
-    res.statusCode = 502
-    res.end(JSON.stringify({ ok: false, error: result.stderr || fallbackError, ...result }))
-    return
-  }
-  res.end(JSON.stringify({ ok: true, data: result.parsed, ...result }))
-}
+export function registerObjectRoutes(router, { conn }) {
+  const get = (path, handler) => router.get(path, route(async (req, res) => {
+    const query = getQuery(req)
+    const nc = await conn.connectFor(req, query)
+    sendJson(res, 200, { ok: true, data: await handler({ req, query, nc }) })
+  }))
+  const post = (path, handler) => router.post(path, route(async (req, res) => {
+    const body = await readJsonBody(req)
+    const nc = await conn.connectFor(req, body)
+    sendJson(res, 200, { ok: true, data: (await handler({ req, body, nc })) ?? null })
+  }))
 
-export function registerObjectRoutes(router, { NATS_URL, NATS_TOKEN }) {
-  router.get('/api/object/buckets', async (req, res) => {
-    res.setHeader('Content-Type', 'application/json')
-    try {
-      const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
-      const conn = getConn({
-        server: url.searchParams.get('server'),
-        token: url.searchParams.get('token'),
-      }, NATS_URL, NATS_TOKEN)
-      const result = await runObject(['ls', '--json'], conn)
-      sendResult(res, result, 'Failed to list object buckets')
-    } catch (err) {
-      res.statusCode = 500
-      res.end(JSON.stringify({ ok: false, error: err.message || 'Failed to list object buckets' }))
-    }
+  get('/api/object/buckets', ({ nc }) => oss.listObjectBuckets(nc))
+  get('/api/object/bucket/:bucket', ({ req, nc }) => oss.objectBucketInfo(nc, req.params.bucket))
+  post('/api/object/bucket/create', ({ body, nc }) => oss.createObjectBucket(nc, body))
+  post('/api/object/bucket/delete', ({ body, nc }) => oss.deleteObjectBucket(nc, body.bucket))
+  post('/api/object/bucket/seal', ({ body, nc }) => oss.sealObjectBucket(nc, body.bucket))
+
+  get('/api/object/list', ({ query, nc }) => oss.listObjects(nc, query.bucket))
+  post('/api/object/info', ({ body, nc }) => oss.objectInfo(nc, body.bucket, body.name))
+  post('/api/object/put', ({ body, nc }) => oss.putObject(nc, body.bucket, body))
+  post('/api/object/delete', ({ body, nc }) => oss.deleteObject(nc, body.bucket, body.name))
+  post('/api/object/link', ({ body, nc }) => oss.linkObject(nc, body.bucket, body.name, body.targetBucket, body.targetName))
+
+  // JSON preview (base64 + utf8 when decodable)
+  post('/api/object/get', async ({ body, nc }) => {
+    const { info, data } = await oss.getObjectBytes(nc, body.bucket, body.name)
+    const preview = data.length <= 1024 * 1024 ? oss.encodeValue(data) : null
+    return { info, preview }
   })
 
-  router.get('/api/object/bucket/:bucket', async (req, res) => {
-    res.setHeader('Content-Type', 'application/json')
-    try {
-      const { bucket } = req.params || {}
-      const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
-      const conn = getConn({
-        server: url.searchParams.get('server'),
-        token: url.searchParams.get('token'),
-      }, NATS_URL, NATS_TOKEN)
-      const result = await runObject(['info', bucket, '--json'], conn)
-      sendResult(res, result, 'Failed to load object bucket info')
-    } catch (err) {
-      res.statusCode = 500
-      res.end(JSON.stringify({ ok: false, error: err.message || 'Failed to load object bucket info' }))
-    }
-  })
-
-  const bucketOps = [
-    ['add', '/api/object/bucket/create'],
-    ['rm', '/api/object/bucket/delete'],
-    ['seal', '/api/object/bucket/seal'],
-  ]
-  for (const [op, path] of bucketOps) {
-    router.post(path, async (req, res) => {
-      res.setHeader('Content-Type', 'application/json')
-      try {
-        const body = await readJsonBody(req)
-        const { bucket, ...config } = body || {}
-        if (!bucket) {
-          res.statusCode = 400
-          res.end(JSON.stringify({ ok: false, error: 'bucket is required' }))
-          return
-        }
-        const conn = getConn(body, NATS_URL, NATS_TOKEN)
-        const args = [op, bucket]
-        if (op === 'add') {
-          if (config.description) args.push('--description', String(config.description))
-          if (config.ttl) args.push('--ttl', String(config.ttl))
-          if (config.maxBucketSize != null) args.push('--max-bucket-size', String(config.maxBucketSize))
-          if (config.replicas != null) args.push('--replicas', String(config.replicas))
-          if (config.storage) args.push('--storage', String(config.storage))
-          if (config.compression) args.push('--compression', String(config.compression))
-        }
-        args.push('--json')
-        const result = await runObject(args, conn)
-        sendResult(res, result, `Failed to ${op} object bucket`)
-      } catch (err) {
-        res.statusCode = 500
-        res.end(JSON.stringify({ ok: false, error: err.message || `Failed to ${op} object bucket` }))
-      }
-    })
-  }
-
-  router.get('/api/object/list', async (req, res) => {
-    res.setHeader('Content-Type', 'application/json')
-    try {
-      const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
-      const bucket = url.searchParams.get('bucket')
-      if (!bucket) {
-        res.statusCode = 400
-        res.end(JSON.stringify({ ok: false, error: 'bucket is required' }))
-        return
-      }
-      const conn = getConn({
-        server: url.searchParams.get('server'),
-        token: url.searchParams.get('token'),
-      }, NATS_URL, NATS_TOKEN)
-      const result = await runObject(['ls', bucket, '--json'], conn)
-      sendResult(res, result, 'Failed to list objects')
-    } catch (err) {
-      res.statusCode = 500
-      res.end(JSON.stringify({ ok: false, error: err.message || 'Failed to list objects' }))
-    }
-  })
-
-  router.post('/api/object/info', async (req, res) => {
-    res.setHeader('Content-Type', 'application/json')
-    try {
-      const body = await readJsonBody(req)
-      const { bucket, name } = body || {}
-      if (!bucket || !name) {
-        res.statusCode = 400
-        res.end(JSON.stringify({ ok: false, error: 'bucket and name are required' }))
-        return
-      }
-      const conn = getConn(body, NATS_URL, NATS_TOKEN)
-      const result = await runObject(['info', bucket, name, '--json'], conn)
-      sendResult(res, result, 'Failed to load object info')
-    } catch (err) {
-      res.statusCode = 500
-      res.end(JSON.stringify({ ok: false, error: err.message || 'Failed to load object info' }))
-    }
-  })
-
-  router.post('/api/object/put', async (req, res) => {
-    res.setHeader('Content-Type', 'application/json')
-    try {
-      const body = await readJsonBody(req)
-      const { bucket, name } = body || {}
-      if (!bucket || !name) {
-        res.statusCode = 400
-        res.end(JSON.stringify({ ok: false, error: 'bucket and name are required' }))
-        return
-      }
-      const conn = getConn(body, NATS_URL, NATS_TOKEN)
-      const result = await putObject(body, conn)
-      sendResult(res, result, 'Failed to upload object')
-    } catch (err) {
-      res.statusCode = 500
-      res.end(JSON.stringify({ ok: false, error: err.message || 'Failed to upload object' }))
-    }
-  })
-
-  router.post('/api/object/get', async (req, res) => {
-    res.setHeader('Content-Type', 'application/json')
-    try {
-      const body = await readJsonBody(req)
-      const { bucket, name } = body || {}
-      if (!bucket || !name) {
-        res.statusCode = 400
-        res.end(JSON.stringify({ ok: false, error: 'bucket and name are required' }))
-        return
-      }
-      const conn = getConn(body, NATS_URL, NATS_TOKEN)
-      const result = await getObject(body, conn)
-      if (!result.ok) {
-        res.statusCode = 502
-        res.end(JSON.stringify({ ok: false, error: result.stderr || 'Failed to download object', ...result }))
-        return
-      }
-      res.end(JSON.stringify({ ok: true, data: result.parsed, contentBase64: result.contentBase64, size: result.size, ...result }))
-    } catch (err) {
-      res.statusCode = 500
-      res.end(JSON.stringify({ ok: false, error: err.message || 'Failed to download object' }))
-    }
-  })
-
-  router.post('/api/object/delete', async (req, res) => {
-    res.setHeader('Content-Type', 'application/json')
-    try {
-      const body = await readJsonBody(req)
-      const { bucket, name } = body || {}
-      if (!bucket || !name) {
-        res.statusCode = 400
-        res.end(JSON.stringify({ ok: false, error: 'bucket and name are required' }))
-        return
-      }
-      const conn = getConn(body, NATS_URL, NATS_TOKEN)
-      const result = await runObject(['rm', bucket, name, '--json'], conn)
-      sendResult(res, result, 'Failed to delete object')
-    } catch (err) {
-      res.statusCode = 500
-      res.end(JSON.stringify({ ok: false, error: err.message || 'Failed to delete object' }))
-    }
-  })
-
-  router.post('/api/object/link', async (req, res) => {
-    res.setHeader('Content-Type', 'application/json')
-    try {
-      const body = await readJsonBody(req)
-      const { bucket, name, targetBucket, targetName } = body || {}
-      if (!bucket || !name || !targetBucket) {
-        res.statusCode = 400
-        res.end(JSON.stringify({ ok: false, error: 'bucket, name and targetBucket are required' }))
-        return
-      }
-      const conn = getConn(body, NATS_URL, NATS_TOKEN)
-      const args = ['link', bucket, name, targetBucket]
-      if (targetName) args.push(targetName)
-      args.push('--json')
-      const result = await runObject(args, conn)
-      sendResult(res, result, 'Failed to create object link')
-    } catch (err) {
-      res.statusCode = 500
-      res.end(JSON.stringify({ ok: false, error: err.message || 'Failed to create object link' }))
-    }
-  })
-
-  router.get('/api/object/watch', async (req, res) => {
-    try {
-      const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
-      const bucket = url.searchParams.get('bucket')
-      if (!bucket) {
-        res.statusCode = 400
-        res.setHeader('Content-Type', 'application/json')
-        res.end(JSON.stringify({ ok: false, error: 'bucket is required' }))
-        return
-      }
-      const name = url.searchParams.get('name')
-      const updatesOnly = url.searchParams.get('updatesOnly') === 'true'
-      const conn = getConn({
-        server: url.searchParams.get('server'),
-        token: url.searchParams.get('token'),
-      }, NATS_URL, NATS_TOKEN)
-      const args = ['watch', bucket]
-      if (name) args.push(name)
-      if (updatesOnly) args.push('--updates-only')
-      args.push('--json')
-      streamWatch({ kind: 'object', args, conn, req, res })
-    } catch (err) {
-      res.statusCode = 500
-      res.setHeader('Content-Type', 'application/json')
-      res.end(JSON.stringify({ ok: false, error: err.message || 'Watch failed' }))
-    }
-  })
-
-  router.post('/api/object/command', async (req, res) => {
-    res.setHeader('Content-Type', 'application/json')
-    try {
-      const body = await readJsonBody(req)
-      const { args } = body || {}
-      if (!Array.isArray(args) || !args.length) {
-        res.statusCode = 400
-        res.end(JSON.stringify({ ok: false, error: 'args must be a non-empty array' }))
-        return
-      }
-      const conn = getConn(body, NATS_URL, NATS_TOKEN)
-      const result = await runCommand(args, conn)
-      sendResult(res, result, 'Command failed')
-    } catch (err) {
-      res.statusCode = 500
-      res.end(JSON.stringify({ ok: false, error: err.message || 'Command failed' }))
-    }
-  })
+  // Raw download
+  router.get('/api/object/download', route(async (req, res) => {
+    const query = getQuery(req)
+    const nc = await conn.connectFor(req, query)
+    const { data } = await oss.getObjectBytes(nc, query.bucket, query.name)
+    res.statusCode = 200
+    res.setHeader('Content-Type', 'application/octet-stream')
+    res.setHeader('Content-Length', data.length)
+    res.setHeader('Content-Disposition', contentDisposition(query.name))
+    res.end(Buffer.from(data))
+  }, 'Download failed'))
 }

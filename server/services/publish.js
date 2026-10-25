@@ -1,71 +1,100 @@
 /**
- * Scheduled publish store — persists in-memory for the lifetime of the server process.
+ * Message publishing + scheduled publish store (in-memory for the lifetime of the process).
  */
 
 import { randomBytes } from 'crypto'
-import { headers as natsHeaders, StringCodec } from 'nats'
+import { headers as natsHeaders } from 'nats'
 import { getConn } from './nats.js'
+import { setLongTimeout, clearLongTimeout } from '../utils/timer.js'
 
-const sc = StringCodec()
 export const scheduledPublishes = new Map()
 
-export async function executePublish(natsServer, token, subject, payload, headersArr, msgTtl) {
+const MAX_FINISHED = 200
+
+function toBytes(payload, encoding) {
+  if (!payload) return new Uint8Array(0)
+  if (encoding === 'base64') return new Uint8Array(Buffer.from(payload, 'base64'))
+  return new TextEncoder().encode(String(payload))
+}
+
+export async function executePublish(natsServer, token, { stream, subject, payload, encoding, headers: headersArr, msgTtl, msgId }) {
   const nc = await getConn(natsServer, token)
   const js = nc.jetstream()
 
-  let hdr
-  const allHeaders = [...(headersArr || [])]
-  if (msgTtl) allHeaders.push({ key: 'Nats-Msg-Ttl', value: msgTtl })
-  if (allHeaders.length) {
-    hdr = natsHeaders()
-    for (const { key, value } of allHeaders) hdr.append(key, String(value))
-  }
+  const allHeaders = [...(headersArr || [])].filter((h) => h && String(h.key || '').trim())
+  if (msgTtl) allHeaders.push({ key: 'Nats-TTL', value: msgTtl })
 
-  const data = payload ? sc.encode(payload) : new Uint8Array(0)
-  const opts = hdr ? { headers: hdr } : {}
-  const ack  = await js.publish(subject, data, opts)
+  const opts = {}
+  if (allHeaders.length) {
+    const hdr = natsHeaders()
+    for (const { key, value } of allHeaders) hdr.append(String(key).trim(), String(value ?? ''))
+    opts.headers = hdr
+  }
+  if (msgId) opts.msgID = String(msgId)
+  if (stream) opts.expect = { streamName: stream }
+
+  const ack = await js.publish(subject, toBytes(payload, encoding), opts)
   return { stream: ack.stream, seq: ack.seq, duplicate: ack.duplicate }
 }
 
-export function schedulePublish({ stream, subject, payload, headers, msgTtl, scheduleAt, natsServer, token }) {
+function pruneFinished() {
+  const finished = [...scheduledPublishes.values()].filter((p) => p.status === 'delivered' || p.status === 'error')
+  if (finished.length <= MAX_FINISHED) return
+  finished
+    .sort((a, b) => new Date(a.scheduleAt) - new Date(b.scheduleAt))
+    .slice(0, finished.length - MAX_FINISHED)
+    .forEach((p) => scheduledPublishes.delete(p.id))
+}
+
+export function schedulePublish({ scheduleAt, natsServer, token, serverKey, ...message }) {
   const targetMs = new Date(scheduleAt).getTime()
-  const delay    = Math.max(0, targetMs - Date.now())
   const id       = randomBytes(8).toString('hex')
 
   const pub = {
-    id, stream, subject, payload,
-    headers:   headers  || [],
-    msgTtl:    msgTtl   || null,
+    id,
+    ...message,
+    headers:   message.headers || [],
+    msgTtl:    message.msgTtl || null,
     server:    natsServer,
+    serverKey: serverKey || natsServer,
     token,
-    scheduleAt,
+    scheduleAt: new Date(targetMs).toISOString(),
     createdAt: new Date().toISOString(),
     status:    'pending',
     result:    null,
     error:     null,
-    timerId:   null,
+    timer:     null,
   }
 
-  pub.timerId = setTimeout(async () => {
+  pub.timer = setLongTimeout(async () => {
     const p = scheduledPublishes.get(id)
     if (!p) return
     p.status = 'running'
     try {
-      p.result = await executePublish(p.server, p.token, p.subject, p.payload, p.headers, p.msgTtl)
+      p.result = await executePublish(p.server, p.token, p)
       p.status = 'delivered'
     } catch (err) {
       p.error  = err.message
       p.status = 'error'
     }
-    p.timerId = null
-  }, delay)
+    p.timer = null
+    pruneFinished()
+  }, targetMs - Date.now())
 
   scheduledPublishes.set(id, pub)
   return pub
 }
 
+export function cancelPublish(id) {
+  const p = scheduledPublishes.get(id)
+  if (!p) return false
+  clearLongTimeout(p.timer)
+  scheduledPublishes.delete(id)
+  return true
+}
+
 export function serializePublish(p) {
   // eslint-disable-next-line no-unused-vars
-  const { timerId, token, server: _srv, ...rest } = p
+  const { timer, token, server: _srv, serverKey: _key, ...rest } = p
   return rest
 }

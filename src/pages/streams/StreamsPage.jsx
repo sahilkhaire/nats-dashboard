@@ -1,485 +1,341 @@
-import { useState, useMemo } from 'react'
-import { useNatsPolling } from '../../hooks/useNatsPolling'
+import { useMemo, useState } from 'react'
+import { Link, useNavigate } from 'react-router-dom'
+import { Columns3, Database, MoreHorizontal, Pencil, Plus, Trash2, Eraser } from 'lucide-react'
+import { useJetStreamData } from '../../hooks/useJetStreamData'
+import { useConfig } from '../../context/ConfigContext'
 import { useStreamMutation } from '../../hooks/useStreamMutation'
 import { useTableSort } from '../../hooks/useTableSort'
 import { usePagination } from '../../hooks/usePagination'
-import { useStreamRates } from '../../hooks/useStreamRates'
 import { useStreamTimeseries } from '../../hooks/useStreamTimeseries'
-import { Link } from 'react-router-dom'
-import { formatBytes } from '../../utils/byteFormatter'
+import { formatBytes, formatBytesRate, formatCompact, formatNumber, formatRate } from '../../utils/byteFormatter'
 import { normalizeRetention } from '../../utils/retention'
-import { StatusBadge } from '../../components/StatusBadge'
-import { SortableTh } from '../../components/ui'
-import { AlertBanner } from '../../components/AlertBanner'
-import { RefreshSelector } from '../../components/RefreshSelector'
-import { UpdateStreamModal } from '../../components/UpdateStreamModal'
+import { timeAgo } from '../../utils/duration'
+import { StatusBadge } from '../../components/ui/StatusBadge'
+import { SortableTh } from '../../components/ui/SortableTh'
+import { MetricCard } from '../../components/ui/MetricCard'
+import { Button } from '../../components/ui/button'
+import {
+  DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger,
+} from '../../components/ui/dropdown-menu'
+import { UpdateStreamModal } from '../../components/modals/UpdateStreamModal'
 import { PaginationBar } from '../../components/shared/PaginationBar'
-import { Button, Input } from '../../components/ui'
-import { StreamSparkline } from './components/StreamSparkline'
-import { Settings, Trash2, Plus, Minus } from 'lucide-react'
+import { PageHeader } from '../../components/shared/PageHeader'
+import { PollState } from '../../components/shared/PageState'
+import { SearchInput, makeMatcher } from '../../components/shared/SearchInput'
+import { EmptyState } from '../../components/shared/EmptyState'
+import { Sparkline } from '../../components/charts/TimeSeriesChart'
 import { useConfirmDialog } from '../../components/shared/ConfirmDialogProvider'
 import { useNotifications } from '../../context/NotificationContext'
 
-// ─── Column group config ─────────────────────────────────────────────────────
-const GROUPS = [
-  {
-    id: 'messages',
-    label: 'Messages',
-    defaultVisible: true,
-    cols: [
-      { key: 'first_seq',    label: 'First Seq' },
-      { key: 'last_seq',     label: 'Last Seq' },
-      { key: 'num_subjects', label: 'Subjects' },
-    ],
-  },
-  {
-    id: 'bytes',
-    label: 'Bytes',
-    defaultVisible: true,
-    cols: [
-      { key: 'bytes', label: 'Size' },
-    ],
-  },
-  {
-    id: 'rates',
-    label: 'Message Rates',
-    defaultVisible: true,
-    cols: [
-      { key: 'msgs_per_sec',  label: 'Msgs/s' },
-      { key: 'bytes_per_sec', label: 'Bytes/s' },
-      { key: 'traffic', label: 'Traffic' },
-    ],
-  },
-  {
-    id: 'consumers',
-    label: 'Consumers',
-    defaultVisible: true,
-    cols: [
-      { key: 'consumers', label: 'Count' },
-    ],
-  },
+const COLUMNS = [
+  { key: 'subjects',      label: 'Subjects',  default: true },
+  { key: 'retention',     label: 'Retention', default: true },
+  { key: 'storage',       label: 'Storage',   default: true },
+  { key: 'messages',      label: 'Messages',  default: true },
+  { key: 'bytes',         label: 'Size',      default: true },
+  { key: 'msgs_per_sec',  label: 'Msgs/s',    default: true },
+  { key: 'bytes_per_sec', label: 'Bytes/s',   default: false },
+  { key: 'traffic',       label: 'Traffic',   default: true },
+  { key: 'consumers',     label: 'Consumers', default: true },
+  { key: 'first_seq',     label: 'First seq', default: false },
+  { key: 'last_seq',      label: 'Last seq',  default: false },
+  { key: 'num_subjects',  label: 'Unique subjects', default: false },
+  { key: 'last_ts',       label: 'Last message', default: true },
 ]
+const COLS_KEY = 'nats-stream-columns'
 
-function loadVisibility() {
+function loadColumns() {
   try {
-    const saved = JSON.parse(localStorage.getItem('nats-stream-col-groups') || 'null')
-    if (saved && typeof saved === 'object') return saved
-  } catch {}
-  return Object.fromEntries(GROUPS.map(g => [g.id, g.defaultVisible]))
+    const saved = JSON.parse(localStorage.getItem(COLS_KEY) || 'null')
+    if (saved && typeof saved === 'object') return { ...Object.fromEntries(COLUMNS.map((c) => [c.key, c.default])), ...saved }
+  } catch { /* ignore */ }
+  return Object.fromEntries(COLUMNS.map((c) => [c.key, c.default]))
 }
 
-function formatRate(val) {
-  if (val == null || val === 0) return <span className="text-muted-foreground">0.0</span>
-  return val >= 1 ? val.toFixed(1) : val.toFixed(2)
-}
-
-// ─── Main page ───────────────────────────────────────────────────────────────
 export function StreamsPage() {
+  const navigate = useNavigate()
   const { confirm } = useConfirmDialog()
+  const { connection } = useConfig()
   const { notifyError, notifySuccess } = useNotifications()
-  const [refreshInterval, setRefreshInterval] = useState(2000)
-  const [updateStreamName, setUpdateStreamName] = useState(null)
-  const [sparklineMetric, setSparklineMetric] = useState('msgsPerSec')
+  const { createStream, deleteStream, updateStream, purgeStream } = useStreamMutation()
+  const { data, error, lastFetch, refetch, streams: allStreams } = useJetStreamData()
 
-  // ── Filter state ──
+  const [modal, setModal] = useState(null) // { mode: 'create' } | { mode: 'edit', name }
   const [search, setSearch] = useState('')
   const [useRegex, setUseRegex] = useState(false)
-  const [regexError, setRegexError] = useState('')
+  const [kind, setKind] = useState('stream')
   const [filterRetention, setFilterRetention] = useState('all')
   const [filterStorage, setFilterStorage] = useState('all')
+  const [visible, setVisible] = useState(loadColumns)
 
-  // ── Column group visibility ──
-  const [groupVisible, setGroupVisible] = useState(loadVisibility)
-
-  const toggleGroup = (id) => {
-    setGroupVisible(prev => {
-      const next = { ...prev, [id]: !prev[id] }
-      try { localStorage.setItem('nats-stream-col-groups', JSON.stringify(next)) } catch {}
-      return next
-    })
+  const series = useStreamTimeseries(allStreams, lastFetch, { cacheKey: `jsz:${connection?.id}` })
+  const rateOf = (name) => {
+    const pts = series.get(name)
+    return pts && pts.length > 1 ? pts[pts.length - 1] : null
   }
 
-  const { data, error, lastFetch, refetch } = useNatsPolling('/jsz?accounts=true&streams=true&config=true', refreshInterval)
-  const { deleteStream, updateStream } = useStreamMutation()
+  const counts = useMemo(() => ({
+    stream: allStreams.filter((s) => s.kind === 'stream').length,
+    kv: allStreams.filter((s) => s.kind === 'kv').length,
+    object: allStreams.filter((s) => s.kind === 'object').length,
+  }), [allStreams])
 
-  const streams = useMemo(() => {
-    const list = []
-    if (data) {
-      for (const acc of data.account_details ?? []) {
-        for (const sd of acc.stream_detail ?? []) {
-          list.push({ ...sd, account: acc.name })
-        }
-      }
-    }
-    return list
-  }, [data])
+  const matcher = makeMatcher(search, useRegex)
+  const filtered = useMemo(() => allStreams.filter((s) =>
+    (kind === 'all' || s.kind === kind)
+    && (matcher.test(s.name) || (s.config?.subjects || []).some((subj) => matcher.test(subj)) || (!useRegex && matcher.test(s.config?.description)))
+    && (filterRetention === 'all' || normalizeRetention(s.config?.retention) === filterRetention)
+    && (filterStorage === 'all' || (s.config?.storage ?? 'file') === filterStorage)),
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  [allStreams, kind, search, useRegex, filterRetention, filterStorage])
 
-  const rates = useStreamRates(streams)
-  const timeseriesByName = useStreamTimeseries(streams, { maxPoints: 60 })
-
-  // ── Filter ──
-  const filtered = useMemo(() => {
-    setRegexError('')
-    let list = streams
-    if (search.trim()) {
-      if (useRegex) {
-        try {
-          const re = new RegExp(search, 'i')
-          list = list.filter(s => re.test(s.name))
-        } catch (e) {
-          setRegexError('Invalid regex')
-          return list
-        }
-      } else {
-        const q = search.toLowerCase()
-        list = list.filter(s => s.name.toLowerCase().includes(q))
-      }
-    }
-    if (filterRetention !== 'all') list = list.filter(s => normalizeRetention(s.config?.retention) === filterRetention)
-    if (filterStorage !== 'all') list = list.filter(s => (s.config?.storage ?? 'file') === filterStorage)
-    return list
-  }, [streams, search, useRegex, filterRetention, filterStorage])
-
-  // ── Sort ──
-  const { sortedData: sortedStreams, sortBy, sortDir, handleSort } = useTableSort(filtered, {
+  const { sortedData, sortBy, sortDir, handleSort } = useTableSort(filtered, {
     defaultSortBy: 'name',
     getSortValue: (s, key) => {
-      if (key === 'name')         return s.name ?? ''
-      if (key === 'subjects')     return (s.config?.subjects ?? []).join(',')
-      if (key === 'retention')    return normalizeRetention(s.config?.retention)
-      if (key === 'storage')      return s.config?.storage ?? ''
-      if (key === 'messages')     return s.state?.messages ?? 0
-      if (key === 'first_seq')    return s.state?.first_seq ?? 0
-      if (key === 'last_seq')     return s.state?.last_seq ?? 0
-      if (key === 'num_subjects') return s.state?.num_subjects ?? 0
-      if (key === 'bytes')        return s.state?.bytes ?? 0
-      if (key === 'consumers')    return s.state?.consumer_count ?? 0
-      if (key === 'msgs_per_sec') return rates.get(s.name)?.msgsPerSec ?? 0
-      if (key === 'bytes_per_sec') return rates.get(s.name)?.bytesPerSec ?? 0
-      if (key === 'traffic') {
-        const points = timeseriesByName.get(s.name) ?? []
-        return points[points.length - 1]?.[sparklineMetric] ?? 0
+      switch (key) {
+        case 'name': return s.name ?? ''
+        case 'subjects': return (s.config?.subjects ?? []).join(',')
+        case 'retention': return normalizeRetention(s.config?.retention)
+        case 'storage': return s.config?.storage ?? ''
+        case 'consumers': return s.state?.consumer_count ?? 0
+        case 'msgs_per_sec':
+        case 'traffic': return rateOf(s.name)?.msgsPerSec ?? 0
+        case 'bytes_per_sec': return rateOf(s.name)?.bytesPerSec ?? 0
+        case 'last_ts': return s.state?.last_ts ? new Date(s.state.last_ts).getTime() : 0
+        default: return s.state?.[key] ?? 0
       }
-      return ''
     },
   })
+  const { pagedData, page, pageSize, totalPages, totalItems, setPage, setPageSize } = usePagination(sortedData, 25)
 
-  // ── Pagination ──
-  const { pagedData, page, pageSize, totalPages, totalItems, setPage, setPageSize } = usePagination(sortedStreams, 10)
+  const totals = useMemo(() => {
+    let messages = 0, bytes = 0, rate = 0
+    for (const s of allStreams) {
+      if (s.kind !== 'stream') continue
+      messages += s.state?.messages ?? 0
+      bytes += s.state?.bytes ?? 0
+      rate += rateOf(s.name)?.msgsPerSec ?? 0
+    }
+    return { messages, bytes, rate }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allStreams, series])
 
-  if (error) return <div className="p-6"><AlertBanner variant="error" title="Error">{error}</AlertBanner></div>
-  if (!data) return <div className="p-6 text-muted-foreground">Loading...</div>
+  const toggleColumn = (key) => setVisible((prev) => {
+    const next = { ...prev, [key]: !prev[key] }
+    try { localStorage.setItem(COLS_KEY, JSON.stringify(next)) } catch { /* ignore */ }
+    return next
+  })
 
-  const handleDelete = async (s, e) => {
-    e.preventDefault()
-    e.stopPropagation()
-    const shouldDelete = await confirm(
-      `Delete stream "${s.name}"?`,
-      'This action permanently removes the stream and all associated data.'
-    )
-    if (!shouldDelete) return
+  const handleDelete = async (s) => {
+    const ok = await confirm(`Delete stream "${s.name}"?`, 'The stream, its messages and all of its consumers are permanently removed.', { confirmLabel: 'Delete stream', requireText: s.name })
+    if (!ok) return
     try {
       await deleteStream(s.name)
+      notifySuccess('Stream deleted', `"${s.name}" was deleted.`, 'stream')
       refetch()
-      notifySuccess('Stream deleted', `"${s.name}" was deleted successfully.`, 'stream')
     } catch (err) {
-      notifyError('Delete failed', err.message || 'Unable to delete stream.', 'stream')
+      notifyError('Delete failed', err.message, 'stream')
     }
   }
 
-  const handleUpdate = async (streamName, config) => {
+  const handlePurge = async (s) => {
+    const ok = await confirm(`Purge all messages in "${s.name}"?`, `${formatNumber(s.state?.messages ?? 0)} messages will be removed. The stream and its configuration are kept.`, { confirmLabel: 'Purge' })
+    if (!ok) return
     try {
-      await updateStream(streamName, config)
-      setUpdateStreamName(null)
+      const res = await purgeStream(s.name)
+      notifySuccess('Stream purged', `${formatNumber(res.purged)} messages removed from "${s.name}".`, 'stream')
       refetch()
-      notifySuccess('Stream updated', `"${streamName}" was updated successfully.`, 'stream')
     } catch (err) {
-      notifyError('Update failed', err.message || 'Unable to update stream.', 'stream')
-      throw err
+      notifyError('Purge failed', err.message, 'stream')
     }
   }
 
-  const streamToEdit = updateStreamName ? streams.find(s => s.name === updateStreamName) : null
+  const handleSave = async (name, config) => {
+    if (name) {
+      await updateStream(name, config)
+      notifySuccess('Stream updated', `"${name}" was updated.`, 'stream')
+      refetch()
+    } else {
+      await createStream(config)
+      notifySuccess('Stream created', `"${config.name}" is ready.`, 'stream')
+      refetch()
+      navigate(`/streams/${encodeURIComponent(config.name)}`)
+    }
+  }
 
-  // ── Visible column keys (flat list for colspan/render) ──
-  const visibleGroups = GROUPS.filter(g => groupVisible[g.id])
-  const visibleCols = visibleGroups.flatMap(g => g.cols)
+  const editing = modal?.mode === 'edit' ? allStreams.find((s) => s.name === modal.name) : null
+  const show = (k) => visible[k]
+  const th = (key, label, cls) => <SortableTh sortKey={key} currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort} className={cls}>{label}</SortableTh>
+  const visibleCount = COLUMNS.filter((c) => visible[c.key]).length + 2
+  const filtersActive = search || filterRetention !== 'all' || filterStorage !== 'all'
 
   return (
-    <div className="space-y-4">
-      {/* ── Top bar ── */}
-      <div className="flex items-center justify-between flex-wrap gap-3">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-          {streams.length} Stream{streams.length !== 1 ? 's' : ''}
-        </h2>
-        <RefreshSelector interval={refreshInterval} onChange={setRefreshInterval} lastFetch={lastFetch} />
-      </div>
+    <div>
+      <PageHeader
+        title="Streams"
+        icon={Database}
+        description="Persistent message logs captured by JetStream"
+        actions={<Button onClick={() => setModal({ mode: 'create' })}><Plus size={15} /> New stream</Button>}
+      />
+      <PollState data={data} error={error} onRetry={refetch}>
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+            <MetricCard label="Streams" value={formatNumber(counts.stream)} subtext={`${counts.kv} KV · ${counts.object} object stores`} />
+            <MetricCard label="Messages" value={formatCompact(totals.messages)} subtext={totals.messages >= 1000 ? formatNumber(totals.messages) : 'in user streams'} />
+            <MetricCard label="Stored" value={formatBytes(totals.bytes)} />
+            <MetricCard label="Ingest" value={formatRate(totals.rate)} subtext="across all streams" />
+          </div>
 
-      {/* ── Filter bar ── */}
-      <div className="flex flex-wrap items-center gap-2.5">
-        <div className="flex flex-1 min-w-[200px] items-center gap-1 rounded border border-border bg-card px-3 py-2">
-          <Input
-            type="text"
-            placeholder="Filter by name…"
-            value={search}
-            onChange={e => { setSearch(e.target.value); setPage(1) }}
-            className="h-auto border-0 bg-transparent p-0 ring-0 focus-visible:ring-0"
-          />
-          <label className="ml-2 flex shrink-0 cursor-pointer select-none items-center gap-1 text-xs text-muted-foreground">
-            <input
-              type="checkbox"
-              checked={useRegex}
-              onChange={e => { setUseRegex(e.target.checked); setPage(1) }}
-              className="accent-foreground"
+          <div className="flex flex-wrap items-start gap-2">
+            <SearchInput
+              value={search}
+              onChange={(v) => { setSearch(v); setPage(1) }}
+              placeholder="Filter by name, subject or description…"
+              regex={useRegex}
+              onRegexChange={setUseRegex}
+              error={matcher.error}
+              className="max-w-md"
             />
-            Regex
-          </label>
-        </div>
-        {regexError && <span className="text-xs text-foreground">{regexError}</span>}
-
-        <select
-          value={filterRetention}
-          onChange={e => { setFilterRetention(e.target.value); setPage(1) }}
-          className="input-enterprise h-10 w-auto px-3 py-2"
-        >
-          <option value="all">All Retention</option>
-          <option value="limits">Limits</option>
-          <option value="interest">Interest</option>
-          <option value="workqueue">Workqueue</option>
-        </select>
-
-        <select
-          value={filterStorage}
-          onChange={e => { setFilterStorage(e.target.value); setPage(1) }}
-          className="input-enterprise h-10 w-auto px-3 py-2"
-        >
-          <option value="all">All Storage</option>
-          <option value="file">File</option>
-          <option value="memory">Memory</option>
-        </select>
-
-        {(search || filterRetention !== 'all' || filterStorage !== 'all') && (
-          <span className="text-xs text-muted-foreground">
-            {totalItems} of {streams.length} shown
-          </span>
-        )}
-        <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
-          <span>Traffic sparkline:</span>
-          <Button
-            onClick={() => setSparklineMetric('msgsPerSec')}
-            variant="outline"
-            size="sm"
-            className={`${
-              sparklineMetric === 'msgsPerSec'
-                ? 'border-foreground/35 text-foreground'
-                : 'text-muted-foreground hover:text-foreground'
-            }`}
-          >
-            Msg/s
-          </Button>
-          <Button
-            onClick={() => setSparklineMetric('bytesPerSec')}
-            variant="outline"
-            size="sm"
-            className={`${
-              sparklineMetric === 'bytesPerSec'
-                ? 'border-foreground/35 text-foreground'
-                : 'text-muted-foreground hover:text-foreground'
-            }`}
-          >
-            Bytes/s
-          </Button>
-        </div>
-      </div>
-
-      {/* ── Table ── */}
-      <div className="premium-table-wrap">
-        <table className="premium-table">
-          {/* ── Spanning group headers ── */}
-          <thead>
-            <tr>
-              {/* Core columns: Name + Subjects + Retention + Storage = 4, no group label */}
-              <th colSpan={5} className="p-0" />
-
-              {visibleGroups.map(g => (
-                <th
-                  key={g.id}
-                  colSpan={g.cols.length}
-                  className="border-l border-border px-3 py-1.5 text-center"
-                >
-                  {g.label}
-                </th>
+            <div className="flex rounded-md border border-input bg-background p-0.5 text-xs shadow-sm">
+              {[['stream', `Streams (${counts.stream})`], ['kv', `KV (${counts.kv})`], ['object', `Objects (${counts.object})`], ['all', 'All']].map(([id, label]) => (
+                <button key={id} type="button" onClick={() => { setKind(id); setPage(1) }}
+                  className={`rounded px-2.5 py-1.5 transition-colors ${kind === id ? 'bg-primary/10 font-medium text-primary' : 'text-muted-foreground hover:text-foreground'}`}>
+                  {label}
+                </button>
               ))}
+            </div>
+            <select value={filterRetention} onChange={(e) => { setFilterRetention(e.target.value); setPage(1) }} className="input-enterprise w-auto" aria-label="Retention">
+              <option value="all">Any retention</option>
+              <option value="limits">Limits</option>
+              <option value="interest">Interest</option>
+              <option value="workqueue">Work queue</option>
+            </select>
+            <select value={filterStorage} onChange={(e) => { setFilterStorage(e.target.value); setPage(1) }} className="input-enterprise w-auto" aria-label="Storage">
+              <option value="all">Any storage</option>
+              <option value="file">File</option>
+              <option value="memory">Memory</option>
+            </select>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm" className="ml-auto h-9"><Columns3 size={14} /> Columns</Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-48">
+                <DropdownMenuLabel>Visible columns</DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                {COLUMNS.map((c) => (
+                  <DropdownMenuCheckboxItem key={c.key} checked={!!visible[c.key]} onCheckedChange={() => toggleColumn(c.key)} onSelect={(e) => e.preventDefault()}>
+                    {c.label}
+                  </DropdownMenuCheckboxItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
 
-              {/* Actions column */}
-              <th className="border-l border-border p-0">
-                {/* +/− toggle button lives here */}
-                <div className="flex justify-end pr-2 py-1">
-                  <div className="relative group">
-                    <button className="flex items-center gap-0.5 rounded border border-border px-1.5 py-0.5 text-xs text-muted-foreground transition-colors hover:border-foreground/40 hover:text-foreground">
-                      <Plus size={10} /><Minus size={10} />
-                    </button>
-                    {/* Dropdown panel */}
-                    <div className="absolute right-0 top-full z-20 mt-1 hidden min-w-[160px] flex-col gap-1 rounded-lg border border-border bg-card p-2 shadow-xl group-hover:flex group-focus-within:flex">
-                      {GROUPS.map(g => (
-                        <label key={g.id} className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 text-xs text-foreground hover:bg-muted/70">
-                          <input
-                            type="checkbox"
-                            checked={!!groupVisible[g.id]}
-                            onChange={() => toggleGroup(g.id)}
-                            className="accent-foreground"
-                          />
-                          {g.label}
-                        </label>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              </th>
-            </tr>
-
-            {/* ── Column headers ── */}
-            <tr>
-              {/* Core */}
-              <SortableTh
-                sortKey="name"
-                currentSortBy={sortBy}
-                currentSortDir={sortDir}
-                onSort={handleSort}
-                className="sticky left-0 z-30 min-w-[240px] border-r border-border bg-card"
-              >
-                Name
-              </SortableTh>
-              <SortableTh sortKey="subjects" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Subjects</SortableTh>
-              <SortableTh sortKey="retention" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Retention</SortableTh>
-              <SortableTh sortKey="storage" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Storage</SortableTh>
-              <SortableTh sortKey="messages" currentSortBy={sortBy} currentSortDir={sortDir} onSort={handleSort}>Total Msgs</SortableTh>
-
-              {/* Dynamic group columns */}
-              {visibleGroups.map((g, gi) =>
-                g.cols.map((col, ci) => (
-                  <SortableTh
-                    key={col.key}
-                    sortKey={col.key}
-                    currentSortBy={sortBy}
-                    currentSortDir={sortDir}
-                    onSort={handleSort}
-                    className={ci === 0 ? 'border-l border-border' : ''}
-                  >
-                    {col.label}
-                  </SortableTh>
-                ))
-              )}
-
-              <th className="w-20 border-l border-border p-3 text-left">Actions</th>
-            </tr>
-          </thead>
-
-          <tbody>
-            {pagedData.length === 0 ? (
-              <tr>
-                <td colSpan={5 + visibleCols.length + 1} className="p-10 text-center text-muted-foreground">
-                  {streams.length === 0 ? 'No streams found.' : 'No streams match the current filter.'}
-                </td>
-              </tr>
-            ) : pagedData.map(s => {
-              const r = rates.get(s.name)
-              return (
-                <tr key={`${s.account}-${s.name}`}>
-                  {/* ── Core ── */}
-                  <td className="sticky left-0 z-20 min-w-[240px] border-r border-border bg-card p-3">
-                    <Link to={`/streams/${encodeURIComponent(s.name)}`} className="font-mono text-foreground hover:text-primary hover:underline">
-                      {s.name}
-                    </Link>
-                  </td>
-                  <td className="p-3">
-                    <div className="flex flex-wrap gap-1">
-                      {(s.config?.subjects?.length ?? 0) > 0 ? (
-                        <>
-                          <span className="rounded bg-muted px-1.5 py-0.5 text-xs text-foreground">
-                            {s.config.subjects[0]}
-                          </span>
-                          {(s.config.subjects.length ?? 0) > 1 && (
-                            <span className="text-xs text-muted-foreground">+{s.config.subjects.length - 1}</span>
-                          )}
-                        </>
-                      ) : (
-                        <span className="text-xs text-muted-foreground">-</span>
-                      )}
-                    </div>
-                  </td>
-                  <td className="p-3"><StatusBadge status="info">{normalizeRetention(s.config?.retention)}</StatusBadge></td>
-                  <td className="p-3 text-foreground">{s.config?.storage ?? 'file'}</td>
-                  <td className="p-3 font-mono font-semibold">{(s.state?.messages ?? 0).toLocaleString()}</td>
-
-                  {/* ── Dynamic group columns ── */}
-                  {visibleGroups.map((g, gi) =>
-                    g.cols.map((col, ci) => {
-                      const borderClass = ci === 0 ? 'border-l border-border' : ''
-                      if (col.key === 'first_seq') return <td key={col.key} className={`p-3 font-mono text-muted-foreground ${borderClass}`}>{(s.state?.first_seq ?? 0).toLocaleString()}</td>
-                      if (col.key === 'last_seq') return <td key={col.key} className={`p-3 font-mono text-muted-foreground ${borderClass}`}>{(s.state?.last_seq ?? 0).toLocaleString()}</td>
-                      if (col.key === 'num_subjects') return <td key={col.key} className={`p-3 font-mono ${borderClass}`}>{(s.state?.num_subjects ?? 0).toLocaleString()}</td>
-                      if (col.key === 'bytes') return <td key={col.key} className={`p-3 ${borderClass}`}>{formatBytes(s.state?.bytes)}</td>
-                      if (col.key === 'msgs_per_sec') return <td key={col.key} className={`p-3 font-mono ${borderClass}`}>{formatRate(r?.msgsPerSec)}</td>
-                      if (col.key === 'bytes_per_sec') return <td key={col.key} className={`p-3 font-mono ${borderClass}`}>{r?.bytesPerSec != null ? formatBytes(r.bytesPerSec) + '/s' : '—'}</td>
-                      if (col.key === 'traffic') {
-                        const points = timeseriesByName.get(s.name) ?? []
-                        return (
-                          <td key={col.key} className={`p-3 ${borderClass}`}>
-                            <StreamSparkline points={points} metric={sparklineMetric} />
-                          </td>
-                        )
-                      }
-                      if (col.key === 'consumers') return <td key={col.key} className={`p-3 ${borderClass}`}>{s.state?.consumer_count ?? 0}</td>
-                      return <td key={col.key} className={`p-3 ${borderClass}`}>—</td>
-                    })
+          {allStreams.length === 0 ? (
+            <div className="surface-card">
+              <EmptyState icon={Database} title="No streams yet" description="Create a stream to start persisting messages published on its subjects."
+                action={<Button onClick={() => setModal({ mode: 'create' })}><Plus size={15} /> New stream</Button>} />
+            </div>
+          ) : (
+            <div className="premium-table-wrap">
+              <table className="premium-table">
+                <thead>
+                  <tr>
+                    {th('name', 'Name', 'sticky left-0 z-10 bg-muted')}
+                    {show('subjects') && th('subjects', 'Subjects')}
+                    {show('retention') && th('retention', 'Retention')}
+                    {show('storage') && th('storage', 'Storage')}
+                    {show('messages') && th('messages', 'Messages')}
+                    {show('bytes') && th('bytes', 'Size')}
+                    {show('msgs_per_sec') && th('msgs_per_sec', 'Msgs/s')}
+                    {show('bytes_per_sec') && th('bytes_per_sec', 'Bytes/s')}
+                    {show('traffic') && th('traffic', 'Traffic')}
+                    {show('consumers') && th('consumers', 'Consumers')}
+                    {show('first_seq') && th('first_seq', 'First seq')}
+                    {show('last_seq') && th('last_seq', 'Last seq')}
+                    {show('num_subjects') && th('num_subjects', 'Unique subj.')}
+                    {show('last_ts') && th('last_ts', 'Last message')}
+                    <th className="w-10"><span className="sr-only">Actions</span></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pagedData.length === 0 && (
+                    <tr>
+                      <td colSpan={visibleCount} className="py-10 text-center text-muted-foreground">
+                        {filtersActive ? 'No streams match the current filters.' : 'Nothing in this view.'}
+                      </td>
+                    </tr>
                   )}
+                  {pagedData.map((s) => {
+                    const r = rateOf(s.name)
+                    const subjects = s.config?.subjects ?? []
+                    return (
+                      <tr key={`${s.account}-${s.name}`} className="group">
+                        <td className="sticky left-0 z-10 bg-card group-hover:bg-muted">
+                          <Link to={`/streams/${encodeURIComponent(s.name)}`} className="font-mono font-medium text-foreground hover:text-primary">
+                            {s.name}
+                          </Link>
+                          {s.config?.sealed && <StatusBadge status="warn" className="ml-2">sealed</StatusBadge>}
+                          {s.config?.mirror && <StatusBadge status="info" className="ml-2">mirror</StatusBadge>}
+                          {s.kind !== 'stream' && <StatusBadge status="accent" className="ml-2">{s.kind === 'kv' ? 'KV' : 'object'}</StatusBadge>}
+                        </td>
+                        {show('subjects') && (
+                          <td>
+                            {subjects.length > 0 ? (
+                              <span className="flex items-center gap-1" title={subjects.join('\n')}>
+                                <span className="chip max-w-[200px] truncate">{subjects[0]}</span>
+                                {subjects.length > 1 && <span className="text-xs text-muted-foreground">+{subjects.length - 1}</span>}
+                              </span>
+                            ) : <span className="text-xs text-muted-foreground">{s.config?.mirror ? `mirror of ${s.config.mirror.name}` : s.config?.sources?.length ? `${s.config.sources.length} source(s)` : '—'}</span>}
+                          </td>
+                        )}
+                        {show('retention') && <td className="text-xs">{normalizeRetention(s.config?.retention)}</td>}
+                        {show('storage') && <td className="text-xs">{s.config?.storage ?? 'file'}{s.config?.num_replicas > 1 ? ` · R${s.config.num_replicas}` : ''}</td>}
+                        {show('messages') && <td className="font-mono tabular" title={formatNumber(s.state?.messages)}>{formatCompact(s.state?.messages ?? 0)}</td>}
+                        {show('bytes') && <td className="font-mono text-xs tabular">{formatBytes(s.state?.bytes ?? 0)}</td>}
+                        {show('msgs_per_sec') && <td className={`font-mono text-xs tabular ${r?.msgsPerSec > 0 ? 'text-foreground' : 'text-muted-foreground'}`}>{r ? formatRate(r.msgsPerSec, '') : '—'}</td>}
+                        {show('bytes_per_sec') && <td className="font-mono text-xs tabular text-muted-foreground">{r ? formatBytesRate(r.bytesPerSec) : '—'}</td>}
+                        {show('traffic') && <td><Sparkline points={series.get(s.name)?.slice(1)} dataKey="msgsPerSec" format={(v) => formatRate(v)} /></td>}
+                        {show('consumers') && <td className="font-mono text-xs tabular">{s.state?.consumer_count ?? 0}</td>}
+                        {show('first_seq') && <td className="font-mono text-xs text-muted-foreground">{formatNumber(s.state?.first_seq)}</td>}
+                        {show('last_seq') && <td className="font-mono text-xs text-muted-foreground">{formatNumber(s.state?.last_seq)}</td>}
+                        {show('num_subjects') && <td className="font-mono text-xs">{formatNumber(s.state?.num_subjects ?? 0)}</td>}
+                        {show('last_ts') && <td className="text-xs text-muted-foreground" title={s.state?.last_ts}>{s.state?.last_seq ? timeAgo(s.state?.last_ts) : 'never'}</td>}
+                        <td>
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button variant="ghost" size="icon" className="h-7 w-7" aria-label={`Actions for ${s.name}`}><MoreHorizontal size={15} /></Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end" className="w-44">
+                              <DropdownMenuItem onSelect={() => navigate(`/streams/${encodeURIComponent(s.name)}?tab=messages`)}>View messages</DropdownMenuItem>
+                              <DropdownMenuItem onSelect={() => setModal({ mode: 'edit', name: s.name })} disabled={s.config?.sealed}><Pencil size={13} /> Edit</DropdownMenuItem>
+                              <DropdownMenuItem onSelect={() => handlePurge(s)} disabled={s.config?.sealed || s.config?.deny_purge}><Eraser size={13} /> Purge</DropdownMenuItem>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem onSelect={() => handleDelete(s)} className="text-nats-error focus:text-nats-error"><Trash2 size={13} /> Delete</DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
 
-                  {/* ── Actions ── */}
-                  <td className="border-l border-border p-3">
-                    <div className="flex gap-1">
-                      <button
-                        onClick={(e) => { e.preventDefault(); e.stopPropagation(); setUpdateStreamName(s.name) }}
-                        className="rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
-                        title="Edit stream"
-                      >
-                        <Settings size={14} />
-                      </button>
-                      <button
-                        onClick={(e) => handleDelete(s, e)}
-                        className="rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
-                        title="Delete stream"
-                      >
-                        <Trash2 size={14} />
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
-      </div>
-
-      {/* ── Pagination ── */}
-      {totalPages > 1 && (
-        <PaginationBar
-          page={page}
-          totalPages={totalPages}
-          totalItems={totalItems}
-          pageSize={pageSize}
-          onPage={setPage}
-          onPageSize={setPageSize}
-          pageSizes={[10, 25, 50, 100, 250]}
-        />
-      )}
+          {totalItems > 25 && (
+            <PaginationBar page={page} totalPages={totalPages} totalItems={totalItems} pageSize={pageSize} onPage={setPage} onPageSize={setPageSize} pageSizes={[25, 50, 100, 250]} />
+          )}
+          {lastFetch && <p className="text-right text-[11px] text-muted-foreground">Rates are computed between refreshes and need two samples.</p>}
+        </div>
+      </PollState>
 
       <UpdateStreamModal
-        open={!!updateStreamName}
-        stream={updateStreamName}
-        config={streamToEdit?.config}
-        onClose={() => setUpdateStreamName(null)}
-        onSave={handleUpdate}
+        open={Boolean(modal)}
+        stream={modal?.mode === 'edit' ? modal.name : null}
+        config={editing?.config}
+        onClose={() => setModal(null)}
+        onSave={handleSave}
       />
     </div>
   )

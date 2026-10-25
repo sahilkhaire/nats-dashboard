@@ -1,71 +1,46 @@
-import { useState, useEffect, useCallback } from 'react'
-
 const STORAGE_KEY = 'nats-dashboard-connections'
 const LAST_CONNECTION_KEY = 'nats-dashboard-last-connection'
 
 /**
- * Normalizes a monitoring URL for storage.
- * Keeps nats:// as-is — the proxy handles converting it to port 4222.
- * Only converts https:// -> http:// (monitoring is plain HTTP).
+ * Normalizes a server URL typed by the user.
+ *  - trims, drops trailing slashes
+ *  - bare "host:port" becomes http:// when it looks like the monitoring port, nats:// otherwise
  */
-export function normalizeMonitoringUrl(url) {
-  if (!url || typeof url !== 'string') return url
-  const u = url.trim().replace(/\/$/, '')
-  if (u.startsWith('https://')) return u.replace('https://', 'http://')
+export function normalizeServerUrl(url) {
+  if (!url || typeof url !== 'string') return ''
+  let u = url.trim().replace(/\/+$/, '')
+  if (!u) return ''
+  if (!/^[a-z]+:\/\//i.test(u)) {
+    u = /:8222$/.test(u) ? `http://${u}` : `nats://${u}`
+  }
   return u
 }
 
-export function useSavedConnections() {
-  const [connections, setConnections] = useState(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY)
-      return raw ? JSON.parse(raw) : []
-    } catch {
-      return []
-    }
-  })
+/** Back-compat alias. */
+export const normalizeMonitoringUrl = normalizeServerUrl
 
-  const saveConnections = useCallback((list) => {
-    setConnections(list)
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(list))
-    } catch {
-      /* ignore */
-    }
-  }, [])
-
-  const addConnection = useCallback((conn) => {
-    const id = `saved-${Date.now()}-${Math.random().toString(36).slice(2)}`
-    const monitoringUrl = normalizeMonitoringUrl(conn.monitoringUrl || conn.url)
-    const newConn = {
-      id,
-      name: conn.name || conn.url || 'Unnamed',
-      monitoringUrl,
-      token: conn.token || null,
-    }
-    saveConnections([...connections, newConn])
-    return newConn
-  }, [connections, saveConnections])
-
-  const removeConnection = useCallback((id) => {
-    saveConnections(connections.filter((c) => c.id !== id))
-  }, [connections, saveConnections])
-
-  const updateConnection = useCallback((id, updates) => {
-    saveConnections(
-      connections.map((c) =>
-        c.id === id ? { ...c, ...updates } : c
-      )
-    )
-  }, [connections, saveConnections])
-
-  return {
-    connections,
-    addConnection,
-    removeConnection,
-    updateConnection,
-    saveConnections,
+export function loadSavedConnections() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    const list = raw ? JSON.parse(raw) : []
+    return Array.isArray(list)
+      ? list.filter((c) => c && c.monitoringUrl).map((c) => ({ ...c, source: 'saved' }))
+      : []
+  } catch {
+    return []
   }
+}
+
+export function storeSavedConnections(list) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(list.map(({ source, ...c }) => c)))
+  } catch {
+    /* ignore */
+  }
+}
+
+export function newConnectionId() {
+  return `saved-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 }
 
 export function getLastConnection() {
@@ -79,11 +54,8 @@ export function getLastConnection() {
 
 export function setLastConnection(conn) {
   try {
-    if (conn) {
-      localStorage.setItem(LAST_CONNECTION_KEY, JSON.stringify(conn))
-    } else {
-      localStorage.removeItem(LAST_CONNECTION_KEY)
-    }
+    if (conn) localStorage.setItem(LAST_CONNECTION_KEY, JSON.stringify(conn))
+    else localStorage.removeItem(LAST_CONNECTION_KEY)
   } catch {
     /* ignore */
   }
