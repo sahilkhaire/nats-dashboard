@@ -2,6 +2,37 @@
   "name": "nats-dashboard",
   "private": true,
   "version": "0.0.13",
+  "description": "Open-source web UI to monitor and manage NATS servers, JetStream streams and consumers, KV and Object Store.",
+  "keywords": [
+    "nats",
+    "nats-dashboard",
+    "nats-ui",
+    "nats-gui",
+    "nats-monitoring",
+    "jetstream",
+    "jetstream-ui",
+    "nats-jetstream",
+    "nats-kv",
+    "nats-object-store",
+    "message-queue",
+    "messaging",
+    "monitoring",
+    "dashboard",
+    "admin-panel",
+    "observability",
+    "docker",
+    "self-hosted"
+  ],
+  "license": "MIT",
+  "author": "Sahil Khaire",
+  "homepage": "https://github.com/sahilkhaire/nats-dashboard#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sahilkhaire/nats-dashboard.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sahilkhaire/nats-dashboard/issues"
+  },
   "type": "module",
   "scripts": {
     "sync-context": "node scripts/sync-nats-context.js",
