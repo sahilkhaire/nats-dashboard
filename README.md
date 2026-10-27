@@ -12,7 +12,7 @@
 [![GitHub Stars](https://img.shields.io/github/stars/sahilkhaire/nats-dashboard?style=social)](https://github.com/sahilkhaire/nats-dashboard/stargazers)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
 
-[Quick start](#quick-start) · [Features](#features) · [Configuration](#configuration) · [FAQ](#faq) · [Contributing](#contributing)
+[Quick start](#quick-start) · [Screenshots](#screenshots) · [Features](#features) · [Configuration](#configuration) · [FAQ](#faq) · [Contributing](#contributing)
 
 </div>
 
@@ -34,7 +34,10 @@ Use it to:
 
 > Works with **NATS Server 2.x** and **JetStream**, standalone or clustered, on Docker, Kubernetes, VMs or your laptop.
 
-<!-- Add a screenshot here, e.g. docs/screenshot.png. Screenshots help a lot with GitHub search and social previews. -->
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/overview-light.png" />
+  <img src="docs/screenshots/overview.png" alt="NATS Dashboard overview page showing live NATS server message rates, connections, JetStream streams and consumers" width="100%" />
+</picture>
 
 ---
 
@@ -91,6 +94,53 @@ npm run start             # http://0.0.0.0:3000
 ```
 
 The dev server binds to `0.0.0.0`, so other machines on your network can open `http://<your-ip>:5173`.
+
+---
+
+## Screenshots
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/screenshots/streams.png" alt="NATS JetStream streams list with message counts, storage size, ingest rate and consumers" />
+      <p align="center"><b>JetStream streams</b>: every stream with message count, size and live ingest rate</p>
+    </td>
+    <td width="50%">
+      <img src="docs/screenshots/stream-detail.png" alt="NATS JetStream stream detail page with ingest rate, bandwidth, consumer backlog and redelivery charts" />
+      <p align="center"><b>Stream detail</b>: ingest rate, bandwidth, consumer backlog and redeliveries</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/screenshots/consumers.png" alt="NATS JetStream consumers table showing consumer lag, pending messages, ack rate and lagging status" />
+      <p align="center"><b>Consumer lag</b>: pending, unacked, redelivered and ack rate, with lagging consumers flagged</p>
+    </td>
+    <td width="50%">
+      <img src="docs/screenshots/stream-messages.png" alt="Browsing and live-tailing messages in a NATS JetStream stream from the web UI" />
+      <p align="center"><b>Message browser</b>: live-tail or browse messages in any stream</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/screenshots/kv.png" alt="NATS Key-Value store UI listing KV buckets, keys and revisions" />
+      <p align="center"><b>Key-Value store</b>: browse buckets, edit keys, view history and watch changes</p>
+    </td>
+    <td width="50%">
+      <img src="docs/screenshots/object-store.png" alt="NATS Object Store UI listing objects with size and chunks, plus upload and download buttons" />
+      <p align="center"><b>Object Store</b>: upload, download and manage objects</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/screenshots/connections.png" alt="NATS client connections table with client name, address, library version and message counts" />
+      <p align="center"><b>Connections</b>: every client with address, library, traffic and subscriptions</p>
+    </td>
+    <td width="50%">
+      <img src="docs/screenshots/overview-light.png" alt="NATS Dashboard overview page in light theme" />
+      <p align="center"><b>Light theme</b>: dark and light themes built in</p>
+    </td>
+  </tr>
+</table>
 
 ---
 
